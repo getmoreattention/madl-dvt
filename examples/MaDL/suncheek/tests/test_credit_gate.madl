@@ -1,0 +1,31 @@
+// Test: CreditGate basic functionality
+// Expected: No deadlock (credits flow correctly in a closed loop)
+
+const tok;
+
+struct Pkt {
+    data : [0:0];
+};
+
+// CreditCounter: produces credit tokens gated by downstream consumption
+macro CreditCounter (int n, chan consumed) => chan credit_out {
+    chan ps := PatientSource(tok);
+    chan q := Queue(n, ps);
+    let credit_out := CtrlJoin(q, consumed);
+};
+
+// Test circuit:
+// Source(Pkt) -> CtrlJoin(data, credit) -> Queue(2) -> Fork -> Sink
+//                    ^                                   |
+//                    |         CreditCounter(3)  <-------+
+//
+// CreditCounter initially has 3 credits.
+// When downstream Fork fires, it signals CreditCounter to release another credit.
+// CtrlJoin gates the Source so it can only send when credits are available.
+
+chan src := Source(Pkt);
+chan downstream := Queue(2, gated);
+chan to_sink, consumed := Fork(downstream);
+chan credit := CreditCounter(3, consumed);
+chan gated := CtrlJoin(src, credit);
+Sink(to_sink);

@@ -1,0 +1,124 @@
+// Suncheek NoC Router Model
+// 2D Mesh Router with XY Deterministic Routing
+//
+// Ports: East(0), South(1), West(2), North(3), Local0(4), Local1(5)
+// Features:
+//   - XY routing with cascaded Switch
+//   - VoQ per output direction (Queue depth=2)
+//   - Merge-based output arbitration
+
+const tok;
+
+// Packet type with routing fields
+struct RPkt {
+    tgtx : [0:0];
+    tgty : [0:0];
+};
+
+// ----------------------------------------------------------------
+// XY Routing for 2x2 mesh
+// Given current position (xID, yID) and packet target (tgtx, tgty):
+//   if tgtx != xID: route East or West (X first)
+//   if tgtx == xID && tgty != yID: route North or South (then Y)
+//   if tgtx == xID && tgty == yID: local delivery
+// ----------------------------------------------------------------
+
+// Simple Request Router: 6 inputs -> 6 outputs
+// Each input is independently routed to the correct output VoQ
+// VoQ depth = voq_depth (typically 2 for flit-level, 1 for packet-level)
+macro SuncheekRouterReq (int xID, int yID, int voq_depth, bus<6> ins) => bus<6> outs {
+    // For each output port, we collect routed packets from all 6 inputs
+    // then Merge them together
+
+    // Predicates for routing
+    pred GoEast (p: RPkt) { p.tgtx > xID };
+    pred GoWest (p: RPkt) { p.tgtx < xID };
+    pred GoNorth (p: RPkt) { p.tgtx == xID && p.tgty > yID };
+    pred GoSouth (p: RPkt) { p.tgtx == xID && p.tgty < yID };
+    pred IsLocal (p: RPkt) { p.tgtx == xID && p.tgty == yID };
+
+    // For each input port, route to the correct output
+    // Using cascaded Switch: first check local, then X, then Y
+    // Input 0 (East)
+    chan i0_local, i0_notlocal := Switch(ins[0], IsLocal, otherwise);
+    chan i0_east, i0_not_east := Switch(i0_notlocal, GoEast, otherwise);
+    chan i0_west, i0_not_west := Switch(i0_not_east, GoWest, otherwise);
+    chan i0_north, i0_south := Switch(i0_not_west, GoNorth, otherwise);
+    // local goes to Local0 (port 4)
+    chan i0_l0, i0_l1 := LoadBalancer(i0_local);
+
+    // Input 1 (South)
+    chan i1_local, i1_notlocal := Switch(ins[1], IsLocal, otherwise);
+    chan i1_east, i1_not_east := Switch(i1_notlocal, GoEast, otherwise);
+    chan i1_west, i1_not_west := Switch(i1_not_east, GoWest, otherwise);
+    chan i1_north, i1_south := Switch(i1_not_west, GoNorth, otherwise);
+    chan i1_l0, i1_l1 := LoadBalancer(i1_local);
+
+    // Input 2 (West)
+    chan i2_local, i2_notlocal := Switch(ins[2], IsLocal, otherwise);
+    chan i2_east, i2_not_east := Switch(i2_notlocal, GoEast, otherwise);
+    chan i2_west, i2_not_west := Switch(i2_not_east, GoWest, otherwise);
+    chan i2_north, i2_south := Switch(i2_not_west, GoNorth, otherwise);
+    chan i2_l0, i2_l1 := LoadBalancer(i2_local);
+
+    // Input 3 (North)
+    chan i3_local, i3_notlocal := Switch(ins[3], IsLocal, otherwise);
+    chan i3_east, i3_not_east := Switch(i3_notlocal, GoEast, otherwise);
+    chan i3_west, i3_not_west := Switch(i3_not_east, GoWest, otherwise);
+    chan i3_north, i3_south := Switch(i3_not_west, GoNorth, otherwise);
+    chan i3_l0, i3_l1 := LoadBalancer(i3_local);
+
+    // Input 4 (Local0 - CPU)
+    chan i4_local, i4_notlocal := Switch(ins[4], IsLocal, otherwise);
+    chan i4_east, i4_not_east := Switch(i4_notlocal, GoEast, otherwise);
+    chan i4_west, i4_not_west := Switch(i4_not_east, GoWest, otherwise);
+    chan i4_north, i4_south := Switch(i4_not_west, GoNorth, otherwise);
+    chan i4_l0, i4_l1 := LoadBalancer(i4_local);
+
+    // Input 5 (Local1 - L3)
+    chan i5_local, i5_notlocal := Switch(ins[5], IsLocal, otherwise);
+    chan i5_east, i5_not_east := Switch(i5_notlocal, GoEast, otherwise);
+    chan i5_west, i5_not_west := Switch(i5_not_east, GoWest, otherwise);
+    chan i5_north, i5_south := Switch(i5_not_west, GoNorth, otherwise);
+    chan i5_l0, i5_l1 := LoadBalancer(i5_local);
+
+    // Output port 0 (East): merge all packets routed East, through VoQ
+    let outs[0] := Queue(voq_depth, Merge(i0_east, Merge(i1_east, Merge(i2_east, Merge(i3_east, Merge(i4_east, i5_east))))));
+
+    // Output port 1 (South): merge all packets routed South, through VoQ
+    let outs[1] := Queue(voq_depth, Merge(i0_south, Merge(i1_south, Merge(i2_south, Merge(i3_south, Merge(i4_south, i5_south))))));
+
+    // Output port 2 (West): merge all packets routed West, through VoQ
+    let outs[2] := Queue(voq_depth, Merge(i0_west, Merge(i1_west, Merge(i2_west, Merge(i3_west, Merge(i4_west, i5_west))))));
+
+    // Output port 3 (North): merge all packets routed North, through VoQ
+    let outs[3] := Queue(voq_depth, Merge(i0_north, Merge(i1_north, Merge(i2_north, Merge(i3_north, Merge(i4_north, i5_north))))));
+
+    // Output port 4 (Local0): merge all local packets to L0
+    let outs[4] := Queue(voq_depth, Merge(i0_l0, Merge(i1_l0, Merge(i2_l0, Merge(i3_l0, Merge(i4_l0, i5_l0))))));
+
+    // Output port 5 (Local1): merge all local packets to L1
+    let outs[5] := Queue(voq_depth, Merge(i0_l1, Merge(i1_l1, Merge(i2_l1, Merge(i3_l1, Merge(i4_l1, i5_l1))))));
+};
+
+
+// Data Channel Router with Shared VoQ support
+// shared_ins: additional inputs from Shared VoQ (for child requests like ReadNoSnp)
+// These bypass the Dedicated VoQ and get their own queue at each output
+macro SuncheekRouterData (int xID, int yID, int voq_depth, bus<6> ins, bus<6> shared_ins) => bus<6> outs {
+    // Route dedicated traffic
+    bus<6> ded_outs;
+    let ded_outs[0], ded_outs[1], ded_outs[2], ded_outs[3], ded_outs[4], ded_outs[5] := SuncheekRouterReq(xID, yID, voq_depth, ins);
+
+    // Route shared traffic (same routing, separate queues)
+    bus<6> sh_outs;
+    let sh_outs[0], sh_outs[1], sh_outs[2], sh_outs[3], sh_outs[4], sh_outs[5] := SuncheekRouterReq(xID, yID, voq_depth, shared_ins);
+
+    // Merge dedicated and shared at each output
+    let outs[0] := Merge(ded_outs[0], sh_outs[0]);
+    let outs[1] := Merge(ded_outs[1], sh_outs[1]);
+    let outs[2] := Merge(ded_outs[2], sh_outs[2]);
+    let outs[3] := Merge(ded_outs[3], sh_outs[3]);
+    let outs[4] := Merge(ded_outs[4], sh_outs[4]);
+    let outs[5] := Merge(ded_outs[5], sh_outs[5]);
+};

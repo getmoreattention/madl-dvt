@@ -1,0 +1,25 @@
+// Suncheek NoC System Types
+// 2x2 Mesh MVP for deadlock verification
+
+param int XDIM = 2;
+param int YDIM = 2;
+param int XBITS = 0;
+param int YBITS = 0;
+param int VOQ_DEPTH = 2;
+param int CREDIT_INIT = 5;
+param int IRSR_DEPTH = 4;
+param int RX_FIFO_DEPTH = 4;
+
+const tok;
+
+// Request packet
+struct ReqPkt {
+    tgtx : [XBITS:0];
+    tgty : [YBITS:0];
+};
+
+// Data packet
+struct DataPkt {
+    tgtx : [XBITS:0];
+    tgty : [YBITS:0];
+};

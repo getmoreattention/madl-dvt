@@ -1,0 +1,48 @@
+// Test: Suncheek RX Data Channel Deadlock (§2.5 in L3 spec)
+//
+// DEADLOCK SCENARIO:
+// - L3 sends ReadNoSnp to DDR (child request)
+// - DDR responds with data on Data Channel
+// - Meanwhile, CPU sends WriteBack data on the SAME Data Channel
+// - If writeback data fills the RX FIFO, DDR response cannot arrive
+// - But L3 can't process writebacks until the pending read completes
+// - CIRCULAR WAIT = DEADLOCK
+//
+// Version A: shared FIFO for both WB data and DDR resp
+// Expected: DEADLOCK
+
+const tok;
+
+struct Pkt {
+    id : [0:0];
+};
+
+// CPU continuously writes back dirty data
+chan cpu_wb := Source(Pkt);
+
+// DDR responds to L3 read requests
+chan ddr_resp := Source(Pkt);
+
+// SHARED FIFO: both cpu_wb and ddr_resp compete for space
+chan shared_fifo := Queue(2, Merge(cpu_wb, ddr_resp));
+
+// L3 agent takes from shared FIFO
+// Some is writeback (process and sink), some is DDR response
+chan wb_path, resp_path := LoadBalancer(shared_fifo);
+
+// L3 IRSR: stores both WB and completed reads
+chan irsr := Queue(2, Merge(wb_path, completed_read));
+
+// L3 processes IRSR entries
+// Some entries are WB (just process), some trigger child requests
+chan wb_processed, to_child := LoadBalancer(irsr);
+Sink(wb_processed);
+
+// Child request to DDR (must also go through the system)
+chan child_src := PatientSource(Pkt);
+chan child_req := CtrlJoin(child_src, to_child);
+Sink(child_req);
+
+// DDR response completion (signals IRSR to free entry)
+chan completed_src := PatientSource(Pkt);
+chan completed_read := CtrlJoin(completed_src, resp_path);

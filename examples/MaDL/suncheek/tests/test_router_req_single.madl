@@ -1,0 +1,41 @@
+// Smoke test: single Suncheek Req router at position (0,0)
+// Should be deadlock-free (no feedback loops).
+// Run from: examples/MaDL/suncheek/
+//   dlockdetect -f tests/test_router_req_single.madl -t
+
+param int XDIM = 2;
+param int YDIM = 2;
+param int XBITS = 0;
+param int YBITS = 0;
+param int REQ_VOQ_DEPTH = 2;
+param int DATA_VOQ_DEPTH = 1;
+
+struct ReqPkt {
+    tgtx : [XBITS:0];
+    tgty : [YBITS:0];
+};
+
+struct DataPkt {
+    tgtx : [XBITS:0];
+    tgty : [YBITS:0];
+};
+
+const tok;
+
+uses lib.suncheek_router;
+
+// Create 6 source channels for the inputs
+chan src_east   := Source(ReqPkt);
+chan src_south  := Source(ReqPkt);
+chan src_west   := Source(ReqPkt);
+chan src_north  := Source(ReqPkt);
+chan src_local0 := Source(ReqPkt);
+chan src_local1 := Source(ReqPkt);
+
+bus<6> outs := SuncheekRouterReq(0, 0,
+    src_east, src_south, src_west, src_north, src_local0, src_local1);
+
+// Sink all outputs
+for (int i = 0; i < 6; i++) {
+    Sink(outs[i]);
+};

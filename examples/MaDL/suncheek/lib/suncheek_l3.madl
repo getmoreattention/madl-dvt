@@ -1,0 +1,48 @@
+// Suncheek L3 Cache / Home Node (HN) Protocol Agent
+// Models the Parent-Child transaction pattern for deadlock verification
+//
+// CRITICAL DESIGN DECISION:
+// Uses Source (not PatientSource) for internal data generation so that
+// the deadlock detector treats blocking as a deadlock condition.
+// In MaDL: Source blocking = deadlock, PatientSource blocking = normal.
+
+const tok;
+
+// L3 Protocol Agent
+// irsr_depth: IRSR buffer depth (models finite IRSR entries)
+// req_in: request from CPU (parent request)
+// ddr_resp_in: response data from DDR
+// Returns: cpu_resp (data to CPU), child_req (ReadNoSnp to DDR)
+macro SuncheekL3 (int irsr_depth, chan req_in, chan ddr_resp_in) => chan cpu_resp, chan child_req {
+    // IRSR (Request Serialization Buffer) - finite capacity
+    // When full, blocks new incoming requests - this is key for deadlock
+    chan irsr_out := Queue(irsr_depth, req_in);
+
+    // Hit/Miss decision (non-deterministic via LoadBalancer)
+    chan hit, miss := LoadBalancer(irsr_out);
+
+    // --- HIT PATH ---
+    // On hit: generate response data immediately
+    // Use Source so blocking here IS detected as deadlock
+    chan hit_src := Source(tok);
+    chan hit_data := CtrlJoin(hit_src, hit);
+
+    // --- MISS PATH ---
+    // On miss: generate child request AND wait for DDR response
+    chan child_token, wait_token := Fork(miss);
+
+    // Generate child request (ReadNoSnp) to DDR
+    // Use Source: if this gets blocked, it means the child request
+    // channel is full — this IS part of the deadlock condition
+    chan child_pkt := Source(tok);
+    let child_req := CtrlJoin(child_pkt, child_token);
+
+    // Wait for DDR response before responding to CPU
+    chan wait_q := Queue(irsr_depth, wait_token);
+    chan ddr_synced := CtrlJoin(wait_q, ddr_resp_in);
+    chan miss_src := Source(tok);
+    chan miss_data := CtrlJoin(miss_src, ddr_synced);
+
+    // Merge hit and miss response paths
+    let cpu_resp := Merge(hit_data, miss_data);
+};

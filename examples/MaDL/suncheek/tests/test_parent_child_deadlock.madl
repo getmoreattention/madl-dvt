@@ -1,0 +1,33 @@
+// Test: Parent-Child Deadlock — Two agents sharing a queue
+// Expected: DEADLOCK DETECTED (Source blocked)
+
+const tok;
+
+struct Pkt {
+    id : [0:0];
+};
+
+// ---- Agent 0 ----
+chan src0 := Source(Pkt);
+chan req_q0 := Queue(1, src0);
+chan local0, remote0 := LoadBalancer(req_q0);
+chan child0, wait0 := Fork(remote0);
+chan waited0 := CtrlJoin(wait0, resp0);
+chan result0 := Merge(local0, waited0);
+Sink(result0);
+
+// ---- Agent 1 ----
+chan src1 := Source(Pkt);
+chan req_q1 := Queue(1, src1);
+chan local1, remote1 := LoadBalancer(req_q1);
+chan child1, wait1 := Fork(remote1);
+chan waited1 := CtrlJoin(wait1, resp1);
+chan result1 := Merge(local1, waited1);
+Sink(result1);
+
+// ---- Shared queue to server ----
+chan to_server := Queue(1, Merge(child0, child1));
+
+// ---- Server: processes and returns responses ----
+chan server_out := Queue(1, to_server);
+chan resp0, resp1 := LoadBalancer(server_out);

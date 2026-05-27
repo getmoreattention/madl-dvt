@@ -1,0 +1,31 @@
+// xMAS Extended Primitives for Suncheek NoC
+// Implemented as macro compositions of standard xMAS primitives
+// No Haskell core modifications required
+
+const tok;
+
+// Latch: 1-deep queue for pipeline stage isolation
+macro Latch (chan input) => chan output {
+    let output := Queue(1, input);
+};
+
+// CreditCounter: produces credit tokens gated by downstream consumption
+// Based on the pattern from ligero/model00.madl
+// n = max credits (initial credit count)
+// consumed = signal from downstream indicating a slot was freed
+// Returns: credit token stream
+macro CreditCounter (int n, chan consumed) => chan credit_out {
+    chan ps := PatientSource(tok);
+    chan q := Queue(n, ps);
+    let credit_out := CtrlJoin(q, consumed);
+};
+
+// CreditGate: blocks data_in when no credits are available
+// init_credits = initial number of credits
+// data_in = data channel to gate
+// credit_return = channel carrying returned credit tokens
+// Returns: gated data channel
+macro CreditGate (int init_credits, chan data_in, chan credit_return) => chan data_out {
+    chan credit_pool := Queue(init_credits, credit_return);
+    let data_out := CtrlJoin(data_in, credit_pool);
+};
