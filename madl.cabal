@@ -37,6 +37,8 @@ library
                   Madl.SourceInformation,
                   Madl.Invariants,
                   Madl.ReachInvariants,
+                  Madl.BackInterpolation,
+                  Madl.Interpolation,
                   Echelon.Echelon,
                   Madl.Deadlock.SMT,
                   Madl.Deadlock.Nuxmv,
@@ -92,12 +94,12 @@ library
                   Parser.MadlParser,
                   Parser.ASTTranslator,
                   Parser.MadlTypeChecker,
-                  Madl2mCRL2.Converter,
+                  Madl2mCRL2.Converter
                   --Madl2fsm.Madl2fsm,
                   --Madl2smv.Converter,
-                  Advocat2madl.Converter,
-                  Advocat2madl.Datastructures,
-                  Advocat2madl.Mesh_MI
+                  --Advocat2madl.Converter,
+                  --Advocat2madl.Datastructures,
+                  --Advocat2madl.Mesh_MI
   build-depends:       base >= 4.7 && < 5,
                        fgl >= 5.5.2,
                        text >= 1.2.1,
@@ -125,7 +127,8 @@ library
                        monad-parallel >= 0.7.2.2,
                        split -any,
                        attoparsec >= 0.13.1.0,
-                       array -any
+                       array -any,
+                       text-replace -any
   default-language:    Haskell2010
 
 executable dlockdetect
@@ -227,8 +230,8 @@ executable parse
                   madl,
                   text >= 1.2.1,
                   base >= 4.7
-   ghc-options: -Wall -Werror
-   default-language: Haskell2010
+    ghc-options: -Wall -Werror
+    default-language: Haskell2010
 
 executable madl2mcrl2
            hs-source-dirs: src/madl2mcrl2
@@ -240,15 +243,15 @@ executable madl2mcrl2
            ghc-options: -Wall -Werror
            default-language: Haskell2010
 
-executable advocat2madl
-           hs-source-dirs: src/advocat2madl
-           main-is: Main.hs
-           build-depends:
-                         madl,
-                         text,
-                         base
-           ghc-options: -Wall -Werror
-           default-language: Haskell2010
+--executable advocat2madl
+--           hs-source-dirs: src/advocat2madl
+--           main-is: Main.hs
+--           build-depends:
+--                         madl,
+--                         text,
+--                         base
+--           ghc-options: -Wall -Werror
+--           default-language: Haskell2010
 
 --executable madl2smv
 --    hs-source-dirs: src/madl2smv
