@@ -1,0 +1,131 @@
+// ==========================================================================
+// 风险2: Snoop Channel Parent-Child 死锁 (SnpReadNoSnp_Custom 方案)
+// ==========================================================================
+//
+// Spec 来源: L3 Architecture §9.2, §2.2 / Router §3.3 / Router §2.1.1
+//
+// 背景:
+//   L3 Architecture §9.2 提出将 ReadNoSnp 改用 Snoop Channel 发送
+//   (SnpReadNoSnp_Custom), 以避免 Request Channel 的 §4.0 死锁。
+//
+//   但 Router Spec §2.1.1 Figure 2-1 显示:
+//   Snoop Channel 只有 Dedicated VoQ, 没有 Shared VoQ!
+//
+//   这意味着 SnpReadNoSnp_Custom (L3→DDR, child) 和
+//   SnpUnique/SnpOnce 等 (L3→Cluster, parent snoop) 共享同一 VoQ,
+//   等同于 §4.0 的死锁条件从 Request Channel 迁移到 Snoop Channel。
+//
+// 拓扑 (复用 §4.0 结构, 通道改为 Snoop):
+//
+//   Cluster_A ←── [snp_voq_w] ←── Router_mid ──→ [snp_voq_e] ──→ Cluster_B
+//                                    |    |
+//                                   L3_A  L3_B
+//                                (HN-West) (HN-East)
+//                                    |    |
+//                                  DDR_A DDR_B
+//
+// Snp VoQ 同时承载:
+//   - L3_A → Cluster_B 的 SnpUnique (parent snoop, eastbound)
+//   - L3_B → DDR_A 的 SnpReadNoSnp_Custom (child, westbound)
+//   (反向亦然)
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int VOQ_DEPTH = 2;       // Router §2.1.1: Dedicated VoQ = 2 flits
+param int CREDIT_INIT = 5;     // Router §2.1.3: CREDITS_INV = 5
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// L3 Sources — 发起 Snoop (parent)
+// L3_A 向 Cluster_B 发 SnpUnique (东向)
+// L3_B 向 Cluster_A 发 SnpUnique (西向)
+// =====================================================================
+chan l3a_snp := Source(tok);     // L3_A → Cluster_B SnpUnique
+chan l3b_snp := Source(tok);     // L3_B → Cluster_A SnpUnique
+
+// =====================================================================
+// Router_mid Snoop Channel 东向 Dedicated VoQ (snp_voq_E)
+//
+// 同时承载:
+//   - L3_A → Cluster_B: SnpUnique (parent snoop, 东向)
+//   - L3_B → DDR_B:     SnpReadNoSnp_Custom (child, 东向)
+//
+// 注意: Snp Channel 没有 Shared VoQ! (Router §2.1.1 Fig 2-1)
+// =====================================================================
+chan snp_voq_e := Queue(VOQ_DEPTH, Merge(l3a_snp_gated, l3b_child));
+
+chan snp_voq_e_out, snp_voq_e_consumed := Fork(snp_voq_e);
+chan credit_e := CreditCounter(CREDIT_INIT, snp_voq_e_consumed);
+chan l3a_snp_gated := CtrlJoin(l3a_snp, credit_e);
+
+// 路由到 Cluster_B 或 DDR_B
+chan to_cluster_b, to_ddr_b := LoadBalancer(snp_voq_e_out);
+
+// =====================================================================
+// Router_mid Snoop Channel 西向 Dedicated VoQ (snp_voq_W)
+// =====================================================================
+chan snp_voq_w := Queue(VOQ_DEPTH, Merge(l3b_snp_gated, l3a_child));
+
+chan snp_voq_w_out, snp_voq_w_consumed := Fork(snp_voq_w);
+chan credit_w := CreditCounter(CREDIT_INIT, snp_voq_w_consumed);
+chan l3b_snp_gated := CtrlJoin(l3b_snp, credit_w);
+
+chan to_cluster_a, to_ddr_a := LoadBalancer(snp_voq_w_out);
+
+// =====================================================================
+// Cluster_B (East) — Snoop 接收端
+// IRSR 饱和 → 阻塞 Snoop 输入 → 不释放 credit
+// =====================================================================
+chan irsr_b := Queue(IRSR_DEPTH, to_cluster_b);
+chan hit_b, miss_b := LoadBalancer(irsr_b);
+Sink(hit_b);
+
+// L3_B miss → 发起 SnpReadNoSnp_Custom → DDR_A (西向)
+chan child_b_tok, wait_b_tok := Fork(miss_b);
+chan child_b_src := Source(tok);
+chan l3b_child := CtrlJoin(child_b_src, child_b_tok);
+
+// 等待 DDR_A 响应
+chan wait_b_q := Queue(IRSR_DEPTH, wait_b_tok);
+chan done_b := CtrlJoin(wait_b_q, ddr_a_resp);
+Sink(done_b);
+
+// =====================================================================
+// Cluster_A (West)
+// =====================================================================
+chan irsr_a := Queue(IRSR_DEPTH, to_cluster_a);
+chan hit_a, miss_a := LoadBalancer(irsr_a);
+Sink(hit_a);
+
+chan child_a_tok, wait_a_tok := Fork(miss_a);
+chan child_a_src := Source(tok);
+chan l3a_child := CtrlJoin(child_a_src, child_a_tok);
+
+chan wait_a_q := Queue(IRSR_DEPTH, wait_a_tok);
+chan done_a := CtrlJoin(wait_a_q, ddr_b_resp);
+Sink(done_a);
+
+// =====================================================================
+// DDR_A (接收 L3_B 的 SnpReadNoSnp_Custom, 通过 snp_voq_w)
+// =====================================================================
+chan ddr_a_sink, ddr_a_fwd := Fork(Queue(1, to_ddr_a));
+Sink(ddr_a_sink);
+chan ddr_a_resp_src := Source(tok);
+chan ddr_a_resp := CtrlJoin(ddr_a_resp_src, ddr_a_fwd);
+
+// =====================================================================
+// DDR_B (接收 L3_A 的 SnpReadNoSnp_Custom, 通过 snp_voq_e)
+// =====================================================================
+chan ddr_b_sink, ddr_b_fwd := Fork(Queue(1, to_ddr_b));
+Sink(ddr_b_sink);
+chan ddr_b_resp_src := Source(tok);
+chan ddr_b_resp := CtrlJoin(ddr_b_resp_src, ddr_b_fwd);

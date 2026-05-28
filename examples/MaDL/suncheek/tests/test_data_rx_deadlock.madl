@@ -1,0 +1,87 @@
+// ==========================================================================
+// 风险1A: Data Channel RX FIFO 死锁 — WriteBack 与 CompData 共享 FIFO
+// ==========================================================================
+//
+// Spec 来源: L3 Spec §2.5 / L3 Architecture §9.1
+//
+// 场景:
+//   Data Channel 同时承载:
+//     - wr_req  (RN→HN): WriteBack_Custom (opcode 3)
+//     - respdata (SN→HN): CompData (opcode 2, DDR 响应)
+//
+//   死锁链:
+//     [1] L3 发起 ReadNoSnp → DDR → IRSR entry 等待 CompData
+//     [2] CPU 持续 WriteBack → 填满共享 RX FIFO
+//     [3] DDR CompData 到达 → 无法进入 FIFO (被 WB 占满)
+//     [4] WBQ 满 → 无法 pop WB → FIFO 持续满
+//     [5] IRSR 等 CompData 才能释放 → CompData 阻塞 → 循环
+//
+// 参数:
+//   RX FIFO depth = 8   (L3 Architecture §8.1)
+//   IRSR entries  = 2   (简化, 加速触发)
+//   WBQ depth     = 2   (简化)
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int FIFO_DEPTH = 8;     // L3 Architecture §8.1: RX FIFO depth
+param int IRSR_DEPTH = 2;
+param int WBQ_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// 流量源
+// =====================================================================
+chan cpu_wb := Source(tok);         // CPU WriteBack_Custom (RN→HN, Data Channel)
+chan ddr_resp := Source(tok);       // DDR CompData (SN→HN, Data Channel)
+
+// =====================================================================
+// 共享 RX FIFO — 死锁根因
+//
+// L3 §9.1: "WBQ 满 → RX FIFO 无法 pop → read response 数据
+//            被 write request 阻塞在同一个 FIFO 中"
+// =====================================================================
+
+// Credit 流控: L3 消费 FIFO entry 后释放 credit 给上游
+chan fifo_out, fifo_consumed := Fork(Queue(FIFO_DEPTH, Merge(cpu_wb_gated, ddr_resp_gated)));
+chan credit_data := CreditCounter(FIFO_DEPTH, fifo_consumed);
+
+// 两个 Source 都受同一个 credit 池门控
+chan credit_wb, credit_resp := Fork(credit_data);
+chan cpu_wb_gated := CtrlJoin(cpu_wb, credit_wb);
+chan ddr_resp_gated := CtrlJoin(ddr_resp, credit_resp);
+
+// =====================================================================
+// L3 内部处理
+// =====================================================================
+
+// 区分 WB 和 CompData (非确定性路由模拟 opcode decode)
+chan wb_path, resp_path := LoadBalancer(fifo_out);
+
+// WBQ: 处理 WriteBack
+chan wbq := Queue(WBQ_DEPTH, wb_path);
+chan wb_done, wb_trigger := Fork(wbq);
+Sink(wb_done);
+
+// IRSR: 读请求 (由 WB 间接触发, 简化为 L3 miss 产生 child)
+chan irsr := Queue(IRSR_DEPTH, wb_trigger);
+chan hit, miss := LoadBalancer(irsr);
+Sink(hit);
+
+// Miss → 发起 ReadNoSnp → DDR (child request)
+chan child_tok, wait_tok := Fork(miss);
+chan child_src := Source(tok);
+chan child_req := CtrlJoin(child_src, child_tok);
+Sink(child_req);
+
+// 等待 DDR CompData 回来
+chan wait_q := Queue(IRSR_DEPTH, wait_tok);
+chan done := CtrlJoin(wait_q, resp_path);
+Sink(done);

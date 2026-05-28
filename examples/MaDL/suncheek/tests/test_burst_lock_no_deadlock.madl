@@ -1,0 +1,69 @@
+// ==========================================================================
+// 风险3B: Burst Lock 正确实现 — credit 不足时 SA 切换到 Shared VoQ
+// ==========================================================================
+//
+// Spec 来源: Router §1.0 Line 67
+//   "for data channel, the dedicate voqs and shared voqs shouldn't
+//    blocked by each other, for example, if the dedicate voq is burst
+//    on going but lack of credit, the Switch Allocator should switch
+//    to the shared voq."
+//
+// 修复:
+//   Dedicated VoQ 和 Shared VoQ 的输出互相独立
+//   Burst lock 只影响 Dedicated VoQ 自身, 不阻塞 Shared VoQ
+//
+// 期望结果: NO DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int DVQO_DEPTH = 2;
+param int SVQO_DEPTH = 2;
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// 流量源
+// =====================================================================
+chan dma_burst := Source(tok);
+chan l3_evict := Source(tok);
+
+// =====================================================================
+// Dedicated VoQ — 独立 credit
+// =====================================================================
+chan ded_voq := Queue(DVQO_DEPTH, dma_burst_gated);
+
+chan ded_voq_out, ded_consumed := Fork(ded_voq);
+chan ded_credit := CreditCounter(5, ded_consumed);
+chan dma_burst_gated := CtrlJoin(dma_burst, ded_credit);
+
+// =====================================================================
+// Shared VoQ — 独立 credit, 独立输出路径 (正确实现)
+// =====================================================================
+chan shared_voq := Queue(SVQO_DEPTH, l3_evict_gated);
+
+chan shared_voq_out, shared_consumed := Fork(shared_voq);
+chan shared_credit := CreditCounter(5, shared_consumed);
+chan l3_evict_gated := CtrlJoin(l3_evict, shared_credit);
+
+// =====================================================================
+// L3 — 独立接收两种 VoQ 的输出, 不互相阻塞
+// =====================================================================
+
+// DMA data → L3 IRSR
+chan irsr := Queue(IRSR_DEPTH, Merge(ded_voq_out, evict_result));
+
+chan processed, need_evict := LoadBalancer(irsr);
+Sink(processed);
+
+// Eviction 通过 Shared VoQ — 独立路径, 不被 burst lock 阻塞
+chan evict_tok, wait_tok := Fork(need_evict);
+chan evict_result := CtrlJoin(shared_voq_out, evict_tok);
+
+// wait_tok 消费 (简化: eviction 完成信号)
+Sink(wait_tok);

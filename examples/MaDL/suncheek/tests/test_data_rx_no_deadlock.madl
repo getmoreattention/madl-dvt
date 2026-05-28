@@ -1,0 +1,73 @@
+// ==========================================================================
+// 风险1B: Data Channel RX FIFO 修复 — 分离 FIFO
+// ==========================================================================
+//
+// Spec 来源: L3 Architecture §9.1 解决方案 / §8.1
+//
+// 修复:
+//   新增独立的 respdata FIFO (depth 8, 通过 is_sn bit 区分来源)
+//   wr_req 和 respdata 不再共享缓冲
+//
+//   wr_req FIFO:   只接收 WriteBack_Custom, WriteClean_Custom, NCBWrdata
+//   respdata FIFO: 只接收 CompData (DDR 响应)
+//
+// 期望结果: NO DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int FIFO_DEPTH = 8;
+param int IRSR_DEPTH = 2;
+param int WBQ_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// 流量源
+// =====================================================================
+chan cpu_wb := Source(tok);         // CPU WriteBack_Custom
+chan ddr_resp := Source(tok);       // DDR CompData
+
+// =====================================================================
+// 分离 FIFO — L3 §9.1 解决方案
+//
+// "新增一个独立的 RX FIFO 专门接收读响应数据。
+//  通过 data flit 中的 is_sn bit 区分读响应 (来自 SN/DDR)
+//  和写请求 (来自 RN)。
+//  即使 wr_req FIFO 满，respdata FIFO 仍可 pop 数据。"
+// =====================================================================
+
+// wr_req FIFO: 独立 credit
+chan wr_fifo := Queue(FIFO_DEPTH, cpu_wb);
+
+// respdata FIFO: 独立 credit
+chan resp_fifo := Queue(FIFO_DEPTH, ddr_resp);
+
+// =====================================================================
+// L3 内部处理
+// =====================================================================
+
+// WBQ: 处理 WriteBack
+chan wbq := Queue(WBQ_DEPTH, wr_fifo);
+chan wb_done, wb_trigger := Fork(wbq);
+Sink(wb_done);
+
+// IRSR
+chan irsr := Queue(IRSR_DEPTH, wb_trigger);
+chan hit, miss := LoadBalancer(irsr);
+Sink(hit);
+
+// Miss → ReadNoSnp → DDR
+chan child_tok, wait_tok := Fork(miss);
+chan child_src := Source(tok);
+chan child_req := CtrlJoin(child_src, child_tok);
+Sink(child_req);
+
+// 等待 DDR CompData (从独立的 respdata FIFO!)
+chan wait_q := Queue(IRSR_DEPTH, wait_tok);
+chan done := CtrlJoin(wait_q, resp_fifo);
+Sink(done);

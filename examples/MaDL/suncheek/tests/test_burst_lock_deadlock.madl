@@ -1,0 +1,92 @@
+// ==========================================================================
+// 风险3A: Data Channel Burst Lock 阻塞 Shared VoQ
+// ==========================================================================
+//
+// Spec 来源: Router §1.0 Line 61-67, §2.1.4
+//
+// 场景 (违反约束):
+//   DMA burst 锁定输出端口，credit 不足时不切换到 Shared VoQ
+//
+//   [1] Dedicated VoQ 中 DMA burst Head flit 赢得 SA
+//   [2] 输出端口 Lock → Shared VoQ 被阻塞
+//   [3] Dedicated VoQ credit 耗尽 → burst 暂停
+//   [4] Shared VoQ 的 WriteNoSnp_Custom (L3 eviction) 无法通过
+//   [5] L3 无法 evict → 无法分配新 cacheline → IRSR 饱和
+//   [6] IRSR 饱和 → 不消费 Dedicated VoQ 的下游 → credit 无法释放
+//       → 循环等待
+//
+// 模型关键:
+//   CtrlJoin 模拟 burst lock: Shared VoQ 输出必须等待 burst 完成信号
+//   burst 完成需要 credit → credit 需要下游消费 → 下游需要 Shared VoQ
+//   → 循环!
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int DVQO_DEPTH = 2;     // Dedicated VoQ depth
+param int SVQO_DEPTH = 2;     // Shared VoQ depth
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// 流量源
+// =====================================================================
+chan dma_burst := Source(tok);    // PCIe DMA burst → Dedicated VoQ
+chan l3_evict := Source(tok);     // L3 eviction WriteNoSnp → Shared VoQ
+
+// =====================================================================
+// Router 输出端口 — Dedicated VoQ
+// =====================================================================
+chan ded_voq := Queue(DVQO_DEPTH, dma_burst_gated);
+
+// credit from downstream (L3 input bus)
+chan ded_voq_out, ded_consumed := Fork(ded_voq);
+chan ded_credit := CreditCounter(5, ded_consumed);
+chan dma_burst_gated := CtrlJoin(dma_burst, ded_credit);
+
+// =====================================================================
+// Router 输出端口 — Shared VoQ
+// =====================================================================
+chan shared_voq := Queue(SVQO_DEPTH, l3_evict_gated);
+
+chan shared_voq_out, shared_consumed := Fork(shared_voq);
+chan shared_credit := CreditCounter(5, shared_consumed);
+chan l3_evict_gated := CtrlJoin(l3_evict, shared_credit);
+
+// =====================================================================
+// 输出端口 Burst Lock — 违反约束的实现
+//
+// §1.0: "the output port locks to that input port"
+// 这里用 CtrlJoin 模拟: Shared VoQ 输出必须等 burst 完成
+// 而 burst 完成依赖 Dedicated VoQ 持续发送 → 需要 credit
+// =====================================================================
+
+// Burst 完成信号: 只有当 Dedicated VoQ 出队一个 flit 时才生成
+chan burst_done_tok, ded_to_l3 := Fork(ded_voq_out);
+
+// Shared VoQ 被 burst lock 门控: 必须等 burst 结束才能发送
+chan shared_unlocked := CtrlJoin(shared_voq_out, burst_done_tok);
+
+// =====================================================================
+// L3 — 下游接收端
+// =====================================================================
+
+// L3 同时接收来自 Dedicated (DMA data) 和 Shared (eviction ack) 的流量
+chan irsr := Queue(IRSR_DEPTH, Merge(ded_to_l3, evict_result));
+
+chan processed, need_evict := LoadBalancer(irsr);
+Sink(processed);
+
+// 需要 evict 时, 必须通过 Shared VoQ (但 Shared VoQ 被 lock!)
+chan evict_tok, wait_tok := Fork(need_evict);
+Sink(wait_tok);
+
+// Eviction 通过 Shared VoQ 路径完成
+chan evict_result := CtrlJoin(shared_unlocked, evict_tok);
