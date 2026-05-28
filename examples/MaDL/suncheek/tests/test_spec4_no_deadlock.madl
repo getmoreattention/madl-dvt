@@ -1,0 +1,109 @@
+// ==========================================================================
+// Suncheek spec §4.2 解决方案 — Shared VoQ 打破死锁
+// ==========================================================================
+//
+// 与 test_spec4_deadlock.madl 相同的拓扑和参数
+// 唯一区别: L3→DDR 的 ReadNoSnp 使用独立的 Shared VoQ
+//
+// spec §4.2:
+//   "Core-to-L3 Requests (Parents) continue to use Dedicated VoQs"
+//   "L3-to-DDR Requests (Children) are exclusively routed into Shared VoQ"
+//   "Even if Dedicated VoQ becomes completely blocked,
+//    the router can still forward ReadNoSnp using independent credits
+//    of the Shared VoQ"
+//
+// 期望结果: NO DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int VOQ_DEPTH = 2;       // spec §2.1.1
+param int CREDIT_INIT = 5;     // spec §2.1.3
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// CPU Sources
+// =====================================================================
+chan core0_req := Source(tok);
+chan core8_req := Source(tok);
+
+// =====================================================================
+// Router_mid DEDICATED VoQ (仅 Parent 流量)
+// spec §4.2: "Core-to-L3 Requests continue to use Dedicated VoQs"
+// =====================================================================
+
+// Dedicated VoQ East: 仅 Core0 → L3_2 (parent)
+chan voq_ded_e := Queue(VOQ_DEPTH, core0_gated);
+chan voq_ded_e_out, voq_ded_e_consumed := Fork(voq_ded_e);
+chan credit_ded_e := CreditCounter(CREDIT_INIT, voq_ded_e_consumed);
+chan core0_gated := CtrlJoin(core0_req, credit_ded_e);
+
+// Dedicated VoQ West: 仅 Core8 → L3_0 (parent)
+chan voq_ded_w := Queue(VOQ_DEPTH, core8_gated);
+chan voq_ded_w_out, voq_ded_w_consumed := Fork(voq_ded_w);
+chan credit_ded_w := CreditCounter(CREDIT_INIT, voq_ded_w_consumed);
+chan core8_gated := CtrlJoin(core8_req, credit_ded_w);
+
+// =====================================================================
+// Router_mid SHARED VoQ (仅 Child 流量: ReadNoSnp)
+// spec §4.2: "L3-to-DDR Requests are exclusively routed into Shared VoQ"
+// "the Shared VoQ has independent credits"
+// =====================================================================
+
+// Shared VoQ East: L3_0 → DDR6 (child, ReadNoSnp)
+chan voq_shared_e := Queue(VOQ_DEPTH, l3_0_child);
+
+// Shared VoQ West: L3_2 → DDR4 (child, ReadNoSnp)
+chan voq_shared_w := Queue(VOQ_DEPTH, l3_2_child);
+
+// =====================================================================
+// L3_2 (East) — 仅从 Dedicated VoQ 接收 parent 请求
+// =====================================================================
+chan irsr_2 := Queue(IRSR_DEPTH, voq_ded_e_out);
+chan hit_2, miss_2 := LoadBalancer(irsr_2);
+Sink(hit_2);
+
+chan child_2_tok, wait_2_tok := Fork(miss_2);
+chan child_2_src := Source(tok);
+chan l3_2_child := CtrlJoin(child_2_src, child_2_tok);
+
+chan wait_2_q := Queue(IRSR_DEPTH, wait_2_tok);
+chan done_2 := CtrlJoin(wait_2_q, ddr4_resp);
+Sink(done_2);
+
+// =====================================================================
+// L3_0 (West) — 仅从 Dedicated VoQ 接收 parent 请求
+// =====================================================================
+chan irsr_0 := Queue(IRSR_DEPTH, voq_ded_w_out);
+chan hit_0, miss_0 := LoadBalancer(irsr_0);
+Sink(hit_0);
+
+chan child_0_tok, wait_0_tok := Fork(miss_0);
+chan child_0_src := Source(tok);
+chan l3_0_child := CtrlJoin(child_0_src, child_0_tok);
+
+chan wait_0_q := Queue(IRSR_DEPTH, wait_0_tok);
+chan done_0 := CtrlJoin(wait_0_q, ddr6_resp);
+Sink(done_0);
+
+// =====================================================================
+// DDR4 — 从 Shared VoQ West 接收 child 请求 (独立路径!)
+// =====================================================================
+chan ddr4_sink, ddr4_fwd := Fork(Queue(1, voq_shared_w));
+Sink(ddr4_sink);
+chan ddr4_resp_src := Source(tok);
+chan ddr4_resp := CtrlJoin(ddr4_resp_src, ddr4_fwd);
+
+// =====================================================================
+// DDR6 — 从 Shared VoQ East 接收 child 请求 (独立路径!)
+// =====================================================================
+chan ddr6_sink, ddr6_fwd := Fork(Queue(1, voq_shared_e));
+Sink(ddr6_sink);
+chan ddr6_resp_src := Source(tok);
+chan ddr6_resp := CtrlJoin(ddr6_resp_src, ddr6_fwd);
