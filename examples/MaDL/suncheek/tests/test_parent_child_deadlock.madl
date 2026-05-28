@@ -1,33 +1,132 @@
-// Test: Parent-Child Deadlock — Two agents sharing a queue
-// Expected: DEADLOCK DETECTED (Source blocked)
+// ==========================================================================
+// Suncheek Parent-Child 死锁模型 V3 — 精确 Credit 流控
+// ==========================================================================
+//
+// 参数来源：
+//   VoQ depth    = 2 flits     (NoC spec §4.1)
+//   Credit init  = 5           (NoC spec §4.3: CREDITS_INV = 5)
+//   IRSR depth   = 2           (简化, 不影响死锁存在性)
+//
+// 精确拓扑 (spec §4.0):
+//
+//   CPU_0 ---+                           +--- CPU_1
+//            |                           |
+//            v                           v
+//     [credit gate]                [credit gate]
+//            |                           |
+//            v                           v
+//     [VoQ_East(2)] ----→ L3_0    L3_1 ←---- [VoQ_West(2)]
+//            ^              |      |              ^
+//            |          child_req child_req        |
+//            |              |      |              |
+//            |              v      v              |
+//            |        [VoQ_to_DDR(2)]             |
+//            |              |                     |
+//            |              v                     |
+//            |            DDR                     |
+//            |              |                     |
+//            |         ddr_response               |
+//            |            /   \                   |
+//            +-----(resp0)     (resp1)----+
+//
+//   DDR 响应通过 SAME VoQ 回到 L3 → 与 CPU 请求竞争 → 死锁!
+//
+// ==========================================================================
 
 const tok;
 
-struct Pkt {
-    id : [0:0];
+param int VOQ_DEPTH = 2;       // NoC spec §4.1
+param int CREDIT_INIT = 5;     // NoC spec §4.3
+param int IRSR_DEPTH = 2;      // 简化
+
+// ---- CreditCounter (MaDL standard library) ----
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
 };
 
-// ---- Agent 0 ----
-chan src0 := Source(Pkt);
-chan req_q0 := Queue(1, src0);
-chan local0, remote0 := LoadBalancer(req_q0);
-chan child0, wait0 := Fork(remote0);
-chan waited0 := CtrlJoin(wait0, resp0);
-chan result0 := Merge(local0, waited0);
-Sink(result0);
+// =====================================================================
+// CPU Sources
+// =====================================================================
+chan cpu0 := Source(tok);
+chan cpu1 := Source(tok);
 
-// ---- Agent 1 ----
-chan src1 := Source(Pkt);
-chan req_q1 := Queue(1, src1);
-chan local1, remote1 := LoadBalancer(req_q1);
-chan child1, wait1 := Fork(remote1);
-chan waited1 := CtrlJoin(wait1, resp1);
-chan result1 := Merge(local1, waited1);
-Sink(result1);
+// =====================================================================
+// VoQ_East: CPU_0 → L3_0 方向
+// (Parent + DDR response 共享此 VoQ)
+// =====================================================================
 
-// ---- Shared queue to server ----
-chan to_server := Queue(1, Merge(child0, child1));
+// DDR 响应 Fork: 一份给 VoQ_East，一份给 VoQ_West
+chan ddr_to_voq0, ddr_to_voq1 := LoadBalancer(ddr_resp);
 
-// ---- Server: processes and returns responses ----
-chan server_out := Queue(1, to_server);
-chan resp0, resp1 := LoadBalancer(server_out);
+// CPU_0 受 credit 门控
+chan cpu0_gated := CtrlJoin(cpu0, credit0);
+
+// VoQ_East: 接收 CPU_0 请求 + DDR 响应
+chan voq_east := Queue(VOQ_DEPTH, Merge(cpu0_gated, ddr_to_voq0));
+
+// VoQ 输出 → L3_0 的 IRSR
+// 同时: VoQ 消费事件释放 credit 给上游 CPU
+chan voq_east_to_l3, voq_east_consumed := Fork(voq_east);
+chan credit0 := CreditCounter(CREDIT_INIT, voq_east_consumed);
+
+// =====================================================================
+// VoQ_West: CPU_1 → L3_1 方向
+// =====================================================================
+chan cpu1_gated := CtrlJoin(cpu1, credit1);
+chan voq_west := Queue(VOQ_DEPTH, Merge(cpu1_gated, ddr_to_voq1));
+chan voq_west_to_l3, voq_west_consumed := Fork(voq_west);
+chan credit1 := CreditCounter(CREDIT_INIT, voq_west_consumed);
+
+// =====================================================================
+// L3_0 Protocol Agent
+// =====================================================================
+// IRSR 接收来自 VoQ_East 的所有流量 (CPU req + DDR resp)
+// L3 通过 LoadBalancer 区分: 一些是新请求(需处理), 一些是 DDR 响应(完成等待)
+chan irsr0 := Queue(IRSR_DEPTH, voq_east_to_l3);
+
+// 非确定性: 进入 hit/miss 处理或作为 DDR 响应完成等待中的事务
+chan process0, complete0 := LoadBalancer(irsr0);
+
+// process0: 新请求的 hit/miss 处理
+chan hit0, miss0 := LoadBalancer(process0);
+Sink(hit0);  // Hit: 直接完成
+
+// Miss: 生成 child request + 等待 DDR
+chan child0_tok, wait0_tok := Fork(miss0);
+chan child0_src := Source(tok);
+chan child0 := CtrlJoin(child0_src, child0_tok);
+
+// wait token 留在队列里等 DDR 响应回来才消费
+chan wait0_q := Queue(IRSR_DEPTH, wait0_tok);
+chan done0 := CtrlJoin(wait0_q, complete0);
+Sink(done0);
+
+// =====================================================================
+// L3_1 Protocol Agent
+// =====================================================================
+chan irsr1 := Queue(IRSR_DEPTH, voq_west_to_l3);
+chan process1, complete1 := LoadBalancer(irsr1);
+chan hit1, miss1 := LoadBalancer(process1);
+Sink(hit1);
+
+chan child1_tok, wait1_tok := Fork(miss1);
+chan child1_src := Source(tok);
+chan child1 := CtrlJoin(child1_src, child1_tok);
+
+chan wait1_q := Queue(IRSR_DEPTH, wait1_tok);
+chan done1 := CtrlJoin(wait1_q, complete1);
+Sink(done1);
+
+// =====================================================================
+// VoQ to DDR: L3 child requests → DDR
+// =====================================================================
+chan voq_ddr := Queue(VOQ_DEPTH, Merge(child0, child1));
+
+// DDR: 消费 request, 产生 response
+chan ddr_sink, ddr_fwd := Fork(voq_ddr);
+Sink(ddr_sink);
+
+chan ddr_resp_src := Source(tok);
+chan ddr_resp := CtrlJoin(ddr_resp_src, ddr_fwd);

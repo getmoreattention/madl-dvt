@@ -1,0 +1,100 @@
+// ==========================================================================
+// Suncheek Parent-Child 死锁模型 V3B — Shared VoQ 解决方案
+// ==========================================================================
+//
+// 与 V3A 相同的参数和拓扑，唯一区别：
+//   Child requests (ReadNoSnp) 使用独立的 **Shared VoQ**
+//   而非与 Parent 共享的 Dedicated VoQ
+//
+// 这是 spec §8.2 描述的解决方案:
+//   "引入独立的 Shared VoQ, 使 Parent 和 Child 事务使用不同的缓冲资源池"
+//
+// 期望结果: NO DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int VOQ_DEPTH = 2;       // NoC spec §4.1
+param int CREDIT_INIT = 5;     // NoC spec §4.3
+param int IRSR_DEPTH = 2;      // 简化
+
+// ---- CreditCounter (MaDL standard library) ----
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// CPU Sources
+// =====================================================================
+chan cpu0 := Source(tok);
+chan cpu1 := Source(tok);
+
+// =====================================================================
+// DEDICATED VoQ: CPU → L3 方向 (仅 Parent 流量)
+// 与 V3A 的区别: DDR 响应不再通过这里!
+// =====================================================================
+chan cpu0_gated := CtrlJoin(cpu0, credit_ded0);
+chan voq_ded_east := Queue(VOQ_DEPTH, cpu0_gated);
+chan voq_ded_east_out, voq_ded_east_consumed := Fork(voq_ded_east);
+chan credit_ded0 := CreditCounter(CREDIT_INIT, voq_ded_east_consumed);
+
+chan cpu1_gated := CtrlJoin(cpu1, credit_ded1);
+chan voq_ded_west := Queue(VOQ_DEPTH, cpu1_gated);
+chan voq_ded_west_out, voq_ded_west_consumed := Fork(voq_ded_west);
+chan credit_ded1 := CreditCounter(CREDIT_INIT, voq_ded_west_consumed);
+
+// =====================================================================
+// SHARED VoQ: DDR → L3 方向 (仅 DDR 响应流量)
+// spec §8.2: "独立信用池，即使 Dedicated VoQ 完全阻塞, Shared VoQ 仍可转发"
+// =====================================================================
+chan ddr_to_voq0, ddr_to_voq1 := LoadBalancer(ddr_resp);
+
+chan voq_shared_0 := Queue(VOQ_DEPTH, ddr_to_voq0);
+chan voq_shared_1 := Queue(VOQ_DEPTH, ddr_to_voq1);
+
+// =====================================================================
+// L3_0 Protocol Agent
+// =====================================================================
+// IRSR 接收来自 Dedicated VoQ 的 CPU 请求
+chan irsr0 := Queue(IRSR_DEPTH, voq_ded_east_out);
+chan hit0, miss0 := LoadBalancer(irsr0);
+Sink(hit0);
+
+chan child0_tok, wait0_tok := Fork(miss0);
+chan child0_src := Source(tok);
+chan child0 := CtrlJoin(child0_src, child0_tok);
+
+// DDR 响应从 Shared VoQ 到达 (独立路径!)
+chan wait0_q := Queue(IRSR_DEPTH, wait0_tok);
+chan done0 := CtrlJoin(wait0_q, voq_shared_0);
+Sink(done0);
+
+// =====================================================================
+// L3_1 Protocol Agent
+// =====================================================================
+chan irsr1 := Queue(IRSR_DEPTH, voq_ded_west_out);
+chan hit1, miss1 := LoadBalancer(irsr1);
+Sink(hit1);
+
+chan child1_tok, wait1_tok := Fork(miss1);
+chan child1_src := Source(tok);
+chan child1 := CtrlJoin(child1_src, child1_tok);
+
+chan wait1_q := Queue(IRSR_DEPTH, wait1_tok);
+chan done1 := CtrlJoin(wait1_q, voq_shared_1);
+Sink(done1);
+
+// =====================================================================
+// VoQ to DDR: L3 child requests (ReadNoSnp) → DDR
+// 使用 Shared VoQ (spec §8.2)
+// =====================================================================
+chan voq_shared_ddr := Queue(VOQ_DEPTH, Merge(child0, child1));
+
+// DDR Controller
+chan ddr_sink, ddr_fwd := Fork(voq_shared_ddr);
+Sink(ddr_sink);
+
+chan ddr_resp_src := Source(tok);
+chan ddr_resp := CtrlJoin(ddr_resp_src, ddr_fwd);
