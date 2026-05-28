@@ -1,0 +1,110 @@
+// ==========================================================================
+// Flit 级别: Wormhole 路由 Data VoQ 容量死锁 (新场景)
+// ==========================================================================
+//
+// Spec 来源:
+//   §2.1.1: VoQ depth = 2 flit
+//   §5.2: Cacheline = 64B = 2 flit
+//   §1.0: Burst locking
+//
+// 关键发现:
+//   Data VoQ(2 flit) = 恰好 1 个 cacheline 包容量
+//   packet 级: Queue(2) = "2 个独立事务" → 宽松
+//   flit   级: Queue(2) = "2 flit = 1 个事务" → 零余量!
+//
+// 场景:
+//   L3_A CompData (2 flit) + L3_B WriteNoSnp (2 flit) 共享东向 VoQ
+//   VoQ(2 flit): 1 包占满 → 第 2 包完全无法进入
+//   如果第 1 包下游阻塞 → 第 2 包永久阻塞 → 死锁
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int VOQ_FLIT = 2;           // §2.1.1: 2 flit
+param int CREDIT_FLIT = 5;        // §2.1.3
+param int RX_FLIT = 4;            // 简化
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// L3_A CompData 东向 (2 flit): parent data
+// L3_B WriteNoSnp 东向 (2 flit): child evict
+// =====================================================================
+chan l3a_f0 := Source(tok);         // CompData flit 0
+chan l3a_f1 := Source(tok);         // CompData flit 1
+chan l3b_f0 := Source(tok);         // WriteNoSnp flit 0
+chan l3b_f1 := Source(tok);         // WriteNoSnp flit 1
+
+// =====================================================================
+// 东向 Data VoQ (2 flit) — 4 路 flit 共享
+//
+// 容量: 2 flit = 1 个 cacheline 包
+// CompData(2 flit) 占满 → WriteNoSnp 的 flit 无法进入!
+// =====================================================================
+chan voq_e_in := Merge(Merge(l3a_f0_g, l3a_f1_g),
+                       Merge(l3b_f0_g, l3b_f1_g));
+
+chan voq_e := Queue(VOQ_FLIT, voq_e_in);
+chan voq_e_out, voq_e_consumed := Fork(voq_e);
+chan credit_e := CreditCounter(CREDIT_FLIT, voq_e_consumed);
+
+chan cr0, cr_r := Fork(credit_e);
+chan cr1, cr_r2 := Fork(cr_r);
+chan cr2, cr3 := Fork(cr_r2);
+
+chan l3a_f0_g := CtrlJoin(l3a_f0, cr0);
+chan l3a_f1_g := CtrlJoin(l3a_f1, cr1);
+chan l3b_f0_g := CtrlJoin(l3b_f0, cr2);
+chan l3b_f1_g := CtrlJoin(l3b_f1, cr3);
+
+// =====================================================================
+// 西向对称
+// =====================================================================
+chan l3b_w0 := Source(tok);
+chan l3b_w1 := Source(tok);
+chan l3a_w0 := Source(tok);
+chan l3a_w1 := Source(tok);
+
+chan voq_w_in := Merge(Merge(l3b_w0_g, l3b_w1_g),
+                       Merge(l3a_w0_g, l3a_w1_g));
+
+chan voq_w := Queue(VOQ_FLIT, voq_w_in);
+chan voq_w_out, voq_w_consumed := Fork(voq_w);
+chan credit_w := CreditCounter(CREDIT_FLIT, voq_w_consumed);
+
+chan cw0, cw_r := Fork(credit_w);
+chan cw1, cw_r2 := Fork(cw_r);
+chan cw2, cw3 := Fork(cw_r2);
+
+chan l3b_w0_g := CtrlJoin(l3b_w0, cw0);
+chan l3b_w1_g := CtrlJoin(l3b_w1, cw1);
+chan l3a_w0_g := CtrlJoin(l3a_w0, cw2);
+chan l3a_w1_g := CtrlJoin(l3a_w1, cw3);
+
+// =====================================================================
+// Cluster_B (East): 接收 CompData flit, 处理后产生 WriteNoSnp
+// =====================================================================
+chan cb_rx := Queue(RX_FLIT, voq_e_out);
+chan cb_irsr := Queue(IRSR_DEPTH, cb_rx);
+chan cb_hit, cb_miss := LoadBalancer(cb_irsr);
+Sink(cb_hit);
+
+// Fork voq_w_out: 一路给 Cluster_B 的 miss 等待, 一路给 Cluster_A
+chan voq_w_to_cb, voq_w_to_ca := Fork(voq_w_out);
+
+// miss → 需要 westbound data → 依赖 voq_w
+chan cb_wait := CtrlJoin(cb_miss, voq_w_to_cb);
+Sink(cb_wait);
+
+// =====================================================================
+// Cluster_A (West)
+// =====================================================================
+chan ca_rx := Queue(RX_FLIT, voq_w_to_ca);
+Sink(ca_rx);

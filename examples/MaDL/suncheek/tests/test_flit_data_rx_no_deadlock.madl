@@ -1,0 +1,47 @@
+// ==========================================================================
+// Flit 级别: Data Channel RX FIFO 修复 — 分离 FIFO
+// ==========================================================================
+//
+// wr_req FIFO (8 flit) 和 respdata FIFO (8 flit) 独立
+// 每个 flit Source 独立进入各自的 FIFO
+//
+// 期望结果: NO DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int FIFO_DEPTH_FLIT = 8;
+param int WBQ_DEPTH_FLIT = 4;
+param int IRSR_DEPTH = 2;
+
+// =====================================================================
+// 流量源: 每类 2 个 flit Source
+// =====================================================================
+chan wb_flit0 := Source(tok);
+chan wb_flit1 := Source(tok);
+chan resp_flit0 := Source(tok);
+chan resp_flit1 := Source(tok);
+
+// =====================================================================
+// 分离 FIFO
+// =====================================================================
+chan wr_fifo := Queue(FIFO_DEPTH_FLIT, Merge(wb_flit0, wb_flit1));
+chan resp_fifo := Queue(FIFO_DEPTH_FLIT, Merge(resp_flit0, resp_flit1));
+
+// =====================================================================
+// L3 内部
+// =====================================================================
+chan wbq := Queue(WBQ_DEPTH_FLIT, wr_fifo);
+chan wb_done, wb_trigger := Fork(wbq);
+Sink(wb_done);
+
+chan irsr := Queue(IRSR_DEPTH, wb_trigger);
+chan hit, miss := LoadBalancer(irsr);
+Sink(hit);
+
+chan child_tok, wait_tok := Fork(miss);
+Sink(child_tok);
+
+chan wait_q := Queue(IRSR_DEPTH, wait_tok);
+chan done := CtrlJoin(wait_q, resp_fifo);
+Sink(done);

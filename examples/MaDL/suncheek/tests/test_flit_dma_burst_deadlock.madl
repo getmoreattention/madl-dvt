@@ -1,0 +1,87 @@
+// ==========================================================================
+// Flit 级别: DMA Burst 超出 VoQ 容量死锁
+// ==========================================================================
+//
+// Spec 来源:
+//   §5.2: DMA 包 = Header(1 flit) + Data(N flit), data_len 最大 1024 DW
+//   §2.1.1: VoQ = 2 flit
+//   §1.0: Burst locking
+//
+// 关键:
+//   DMA 4-flit burst → VoQ(2) 只放 2 flit → 剩余在上游
+//   Burst lock 锁输出端口 → Shared VoQ 被阻塞
+//   Shared VoQ 的 WriteNoSnp (2 flit/包) 也无法通过
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int VOQ_FLIT = 2;
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// DMA Burst: 4 个独立 flit Source
+// =====================================================================
+chan dma_f0 := Source(tok);        // Header flit
+chan dma_f1 := Source(tok);        // Data flit 0
+chan dma_f2 := Source(tok);        // Data flit 1
+chan dma_f3 := Source(tok);        // Data flit 2
+
+// L3 eviction: 2 flit Source
+chan evict_f0 := Source(tok);
+chan evict_f1 := Source(tok);
+
+// =====================================================================
+// Dedicated VoQ (2 flit): DMA burst 的 4 flit 共享 credit
+// =====================================================================
+chan ded_in := Merge(Merge(dma_f0_g, dma_f1_g),
+                     Merge(dma_f2_g, dma_f3_g));
+
+chan ded_voq := Queue(VOQ_FLIT, ded_in);
+chan ded_out, ded_consumed := Fork(ded_voq);
+chan ded_credit := CreditCounter(VOQ_FLIT, ded_consumed);
+
+chan cd0, cd_r := Fork(ded_credit);
+chan cd1, cd_r2 := Fork(cd_r);
+chan cd2, cd3 := Fork(cd_r2);
+
+chan dma_f0_g := CtrlJoin(dma_f0, cd0);
+chan dma_f1_g := CtrlJoin(dma_f1, cd1);
+chan dma_f2_g := CtrlJoin(dma_f2, cd2);
+chan dma_f3_g := CtrlJoin(dma_f3, cd3);
+
+// =====================================================================
+// Shared VoQ (2 flit): L3 eviction
+// =====================================================================
+chan shared_in := Merge(evict_f0_g, evict_f1_g);
+chan shared_voq := Queue(VOQ_FLIT, shared_in);
+chan shared_out, shared_consumed := Fork(shared_voq);
+chan shared_credit := CreditCounter(VOQ_FLIT, shared_consumed);
+chan ce0, ce1 := Fork(shared_credit);
+
+chan evict_f0_g := CtrlJoin(evict_f0, ce0);
+chan evict_f1_g := CtrlJoin(evict_f1, ce1);
+
+// =====================================================================
+// Burst Lock: Shared VoQ 被 DMA burst 锁定
+// =====================================================================
+chan burst_done, ded_to_l3 := Fork(ded_out);
+chan shared_unlocked := CtrlJoin(shared_out, burst_done);
+
+// =====================================================================
+// L3 端
+// =====================================================================
+chan l3_rx := Queue(IRSR_DEPTH, Merge(ded_to_l3, evict_result));
+chan processed, need_evict := LoadBalancer(l3_rx);
+Sink(processed);
+
+chan evict_tok, wait_tok := Fork(need_evict);
+Sink(wait_tok);
+chan evict_result := CtrlJoin(shared_unlocked, evict_tok);

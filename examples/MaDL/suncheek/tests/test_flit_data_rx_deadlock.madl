@@ -1,0 +1,86 @@
+// ==========================================================================
+// Flit 级别: Data Channel RX FIFO 死锁
+// ==========================================================================
+//
+// 与 test_data_rx_deadlock.madl 相同场景, 粒度从 packet 改为 flit
+//
+// Spec 关键参数 (flit 级):
+//   Data Channel flit width = 256-bit (§5.2)
+//   Cacheline = 64B = 2 flit  (data_id=0 + data_id=1)
+//   RX FIFO = 8 flit = 4 个 cacheline 包 (§8.1)
+//   WBQ = 4 flit = 2 个 WB 包
+//
+// 与 packet 级的关键区别:
+//   packet 级: Queue(8) = 8 个完整事务 → 不容易满
+//   flit   级: Queue(8) = 8 flit = 4 个事务 → 容量减半
+//
+// 建模方法:
+//   每个 cacheline 事务由 2 个 Source flit 组成
+//   Queue 深度 = 物理 flit 数
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int FIFO_DEPTH_FLIT = 8;     // §8.1: 8 flit
+param int WBQ_DEPTH_FLIT = 4;      // 4 flit = 2 WB 包
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// 流量源: 每个 cacheline = 2 flit
+// WB: 2 个独立 flit Source (head + tail)
+// CompData: 2 个独立 flit Source
+// =====================================================================
+chan wb_flit0 := Source(tok);       // WriteBack flit 0 (data_id=0)
+chan wb_flit1 := Source(tok);       // WriteBack flit 1 (data_id=1)
+chan resp_flit0 := Source(tok);     // CompData flit 0
+chan resp_flit1 := Source(tok);     // CompData flit 1
+
+// =====================================================================
+// 共享 RX FIFO — 8 flit 深度
+//
+// 4 路 flit 共享同一个 FIFO + 同一个 credit 池
+// WB 的 4 flit (2 包 × 2 flit) 就占一半!
+// =====================================================================
+chan fifo_in := Merge(Merge(wb_f0_gated, wb_f1_gated),
+                      Merge(resp_f0_gated, resp_f1_gated));
+
+chan fifo_out, fifo_consumed := Fork(Queue(FIFO_DEPTH_FLIT, fifo_in));
+chan fifo_credit := CreditCounter(FIFO_DEPTH_FLIT, fifo_consumed);
+
+// 4 路共享 credit
+chan cr0, cr_rest := Fork(fifo_credit);
+chan cr1, cr_rest2 := Fork(cr_rest);
+chan cr2, cr3 := Fork(cr_rest2);
+
+chan wb_f0_gated := CtrlJoin(wb_flit0, cr0);
+chan wb_f1_gated := CtrlJoin(wb_flit1, cr1);
+chan resp_f0_gated := CtrlJoin(resp_flit0, cr2);
+chan resp_f1_gated := CtrlJoin(resp_flit1, cr3);
+
+// =====================================================================
+// L3 内部处理
+// =====================================================================
+chan wb_path, resp_path := LoadBalancer(fifo_out);
+
+chan wbq := Queue(WBQ_DEPTH_FLIT, wb_path);
+chan wb_done, wb_trigger := Fork(wbq);
+Sink(wb_done);
+
+chan irsr := Queue(IRSR_DEPTH, wb_trigger);
+chan hit, miss := LoadBalancer(irsr);
+Sink(hit);
+
+chan child_tok, wait_tok := Fork(miss);
+Sink(child_tok);
+
+chan wait_q := Queue(IRSR_DEPTH, wait_tok);
+chan done := CtrlJoin(wait_q, resp_path);
+Sink(done);
