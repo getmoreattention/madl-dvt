@@ -1,0 +1,129 @@
+// ==========================================================================
+// Channel Separation — 现实场景 (简化版)
+// ==========================================================================
+//
+// 聚焦核心问题: Snoop Channel 混合 parent+child 是否产生死锁
+//
+// 简化: 去掉 Request Channel 的详细建模 (已证 UNSAT)
+//       只建模 Snoop Channel + L3 IRSR 依赖
+//
+// Snoop Channel Ded VoQ 携带:
+//   - SnpReadNoSnp_Custom (child): L3 miss → DDR
+//   - SnpUnique (parent): L3 → 远端 Cluster 一致性探查
+//
+// 期望: DEADLOCK (与 §4.0 Req Channel 同构)
+// ==========================================================================
+
+const tok;
+
+param int VOQ_DEPTH = 2;       // §2.1.1
+param int CREDIT_INIT = 5;     // §2.1.3
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// Snoop Channel 东向 VoQ: parent SnpUnique + child SnpReadNoSnp
+//
+// L3_0 → Core0 (SnpUnique, parent, eastbound)
+// L3_0 → DDR6  (SnpReadNoSnp_Custom, child, eastbound)
+//
+// 与 §4.0 Req Channel 的结构对比:
+//   §4.0 Req:  Merge(Core0_parent, L3_0_child) → req_voq_e
+//   这里 Snp: Merge(SnpUnique_parent, SnpReadNoSnp_child) → snp_voq_e
+// =====================================================================
+chan snp_parent_e := Source(tok);    // SnpUnique from L3_0 → Core0
+chan snp_child_e := Source(tok);     // SnpReadNoSnp from L3_0 → DDR6
+
+chan snp_voq_e := Queue(VOQ_DEPTH, Merge(snp_parent_e_gated, snp_child_e_gated));
+chan snp_e_out, snp_e_consumed := Fork(snp_voq_e);
+chan credit_snp_e := CreditCounter(CREDIT_INIT, snp_e_consumed);
+
+// parent 和 child 共享 credit → 死锁根因
+chan cr_e_parent, cr_e_child := Fork(credit_snp_e);
+chan snp_parent_e_gated := CtrlJoin(snp_parent_e, cr_e_parent);
+chan snp_child_e_gated := CtrlJoin(snp_child_e, cr_e_child);
+
+// =====================================================================
+// Snoop Channel 西向 VoQ: 对称
+//
+// L3_2 → Core8 (SnpUnique, parent, westbound)
+// L3_2 → DDR4  (SnpReadNoSnp_Custom, child, westbound)
+// =====================================================================
+chan snp_parent_w := Source(tok);
+chan snp_child_w := Source(tok);
+
+chan snp_voq_w := Queue(VOQ_DEPTH, Merge(snp_parent_w_gated, snp_child_w_gated));
+chan snp_w_out, snp_w_consumed := Fork(snp_voq_w);
+chan credit_snp_w := CreditCounter(CREDIT_INIT, snp_w_consumed);
+
+chan cr_w_parent, cr_w_child := Fork(credit_snp_w);
+chan snp_parent_w_gated := CtrlJoin(snp_parent_w, cr_w_parent);
+chan snp_child_w_gated := CtrlJoin(snp_child_w, cr_w_child);
+
+// =====================================================================
+// East side: Core0 接收 SnpUnique, DDR6 接收 SnpReadNoSnp
+// =====================================================================
+chan to_core0, to_ddr6 := LoadBalancer(snp_e_out);
+
+// Core0 处理 snoop
+chan core0_snp_q := Queue(IRSR_DEPTH, to_core0);
+Sink(core0_snp_q);
+
+// DDR6 处理 ReadNoSnp → 返回 CompData
+chan ddr6_q := Queue(1, to_ddr6);
+chan ddr6_done, ddr6_resp_trigger := Fork(ddr6_q);
+Sink(ddr6_done);
+chan ddr6_resp_src := Source(tok);
+chan ddr6_resp := CtrlJoin(ddr6_resp_src, ddr6_resp_trigger);
+
+// =====================================================================
+// West side: Core8 接收 SnpUnique, DDR4 接收 SnpReadNoSnp
+// =====================================================================
+chan to_core8, to_ddr4 := LoadBalancer(snp_w_out);
+
+chan core8_snp_q := Queue(IRSR_DEPTH, to_core8);
+Sink(core8_snp_q);
+
+chan ddr4_q := Queue(1, to_ddr4);
+chan ddr4_done, ddr4_resp_trigger := Fork(ddr4_q);
+Sink(ddr4_done);
+chan ddr4_resp_src := Source(tok);
+chan ddr4_resp := CtrlJoin(ddr4_resp_src, ddr4_resp_trigger);
+
+// =====================================================================
+// L3 IRSR 依赖: miss 产生 SnpReadNoSnp, 等 DDR 响应
+//
+// L3_0 (west side):
+//   IRSR 收 parent 请求 → miss → 发 SnpReadNoSnp → 等 DDR6 响应
+//   IRSR 满 → 不接受新请求 → parent SnpUnique 也被 backpressure
+//   但 SnpUnique 去的是 Core0 (east), 不经过 L3_0 IRSR
+// 真正的循环:
+//   SnpUnique 占了 snp_voq_e credit → SnpReadNoSnp 拿不到 credit
+//   → DDR6 收不到请求 → 不返响应 → L3_0 IRSR 不释放
+//   → 产生更多 SnpUnique (新请求触发) → 消耗更多 credit → 循环
+// =====================================================================
+
+// L3_0 IRSR: 接收 parent 请求, miss → child SnpReadNoSnp
+chan parent_req_0 := Source(tok);
+chan irsr_0 := Queue(IRSR_DEPTH, parent_req_0);
+chan hit_0, miss_0 := LoadBalancer(irsr_0);
+Sink(hit_0);
+
+chan wait_0 := Queue(IRSR_DEPTH, miss_0);
+chan done_0 := CtrlJoin(wait_0, ddr6_resp);
+Sink(done_0);
+
+// L3_2 IRSR: 对称
+chan parent_req_2 := Source(tok);
+chan irsr_2 := Queue(IRSR_DEPTH, parent_req_2);
+chan hit_2, miss_2 := LoadBalancer(irsr_2);
+Sink(hit_2);
+
+chan wait_2 := Queue(IRSR_DEPTH, miss_2);
+chan done_2 := CtrlJoin(wait_2, ddr4_resp);
+Sink(done_2);
