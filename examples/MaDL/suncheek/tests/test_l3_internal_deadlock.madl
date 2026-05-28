@@ -1,0 +1,127 @@
+// ==========================================================================
+// 风险4: L3 内部 IRSR/OIRSR/Pipeline 资源死锁
+// ==========================================================================
+//
+// Spec 来源: L3 Architecture §5.2-§5.4, §6.1-§6.3
+//
+// 场景:
+//   L3 内部 buffer 资源循环占用, 表现为 NoC credit 耗尽:
+//
+//   [1] 所有 IRSR entry 占满 (PPL_WAIT 等待 SnpResp/CompAck)
+//   [2] L3 阻塞 RX input bus — 不接收新请求
+//   [3] SF Overflow → OIRSR 需要发起 back-invalidation (SnpUnique)
+//   [4] OIRSR 需要 Pipeline (PPL_LOOKUP) → Pipeline 被 IRSR 占满
+//   [5] IRSR 在 WAIT_SNPRESP → 等待来自 RN 的 SnpResp
+//   [6] SnpResp 在 RX Response FIFO → 但 L3 RX bus 阻塞 → 无法消费
+//   [7] 循环: IRSR 满 → RX 阻塞 → 无法收到完成信号 → IRSR 无法释放
+//
+// 关键问题:
+//   L3 的 Response RX FIFO 是否独立于 Request RX FIFO？
+//   - 如果独立: SnpResp/CompAck 仍可被消费, 打破循环
+//   - 如果共享: 形成真正死锁
+//
+// 本模型建模 "共享 RX bus" 的最坏情况
+//
+// 参数:
+//   IRSR depth  = 2     (简化)
+//   OIRSR depth = 1     (L3 Architecture §5.3)
+//   Pipeline    = 1     (序列化, 简化为单 slot)
+//   RX FIFO     = 2     (简化, 共享)
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int IRSR_DEPTH = 2;
+param int OIRSR_DEPTH = 1;
+param int PIPELINE_DEPTH = 1;
+param int RX_FIFO_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// 外部流量源
+// =====================================================================
+
+// Core → L3 请求 (经 NoC Request Channel)
+chan core_req := Source(tok);
+
+// Core → L3 SnpResp/CompAck 响应 (经 NoC Response Channel)
+chan core_resp := Source(tok);
+
+// SF Overflow 触发 (内部事件)
+chan sf_overflow := Source(tok);
+
+// =====================================================================
+// L3 RX Bus — 共享 (最坏情况)
+//
+// L3 Architecture §8.1:
+//   Request RX = 8 entry, Response RX = 6 entry
+//   本模型将两者简化为一个共享 FIFO, 测试最坏情况
+// =====================================================================
+
+chan rx_fifo := Queue(RX_FIFO_DEPTH, Merge(core_req_gated, core_resp_gated));
+
+// Credit: RX FIFO 消费后释放 credit 给 NoC Router
+chan rx_out, rx_consumed := Fork(rx_fifo);
+chan rx_credit := CreditCounter(RX_FIFO_DEPTH, rx_consumed);
+chan rx_credit_req, rx_credit_resp := Fork(rx_credit);
+chan core_req_gated := CtrlJoin(core_req, rx_credit_req);
+chan core_resp_gated := CtrlJoin(core_resp, rx_credit_resp);
+
+// =====================================================================
+// IRSR — In-fly Request Status Registers
+// L3 Architecture §5.2: 保持 in-flight 一致性请求
+// =====================================================================
+
+// 来自 RX 的请求和来自 OIRSR replay 的请求都进入 Pipeline
+chan req_path, resp_path := LoadBalancer(rx_out);
+
+chan irsr := Queue(IRSR_DEPTH, req_path);
+
+// =====================================================================
+// Pipeline — P0~P5 序列化
+// L3 Architecture §7.1: 6 级 Pipeline
+// 简化为单 slot Queue, IRSR 和 OIRSR 共享
+// =====================================================================
+
+// IRSR 进入 Pipeline
+chan irsr_out := Queue(PIPELINE_DEPTH, irsr);
+
+// Pipeline 评估结果
+chan ppl_hit, ppl_miss := LoadBalancer(irsr_out);
+Sink(ppl_hit);   // Hit → 直接完成
+
+// Miss → 进入 WAIT_SNPRESP (等待 Snoop 响应)
+// 需要先发 Snoop (TX Snp Channel) 再等 SnpResp (RX Resp Channel)
+chan snp_tok, wait_snp_tok := Fork(ppl_miss);
+
+// 发送 Snoop 到 cluster (TX Snoop Channel, 独立, 不建模阻塞)
+Sink(snp_tok);
+
+// 等待 SnpResp 从 resp_path 到达
+chan wait_resp_q := Queue(IRSR_DEPTH, wait_snp_tok);
+chan irsr_done := CtrlJoin(wait_resp_q, resp_path);
+Sink(irsr_done);
+
+// =====================================================================
+// OIRSR — SF Overflow 处理
+// L3 Architecture §5.3: 处理 SF overflow back-invalidation
+// =====================================================================
+
+chan oirsr := Queue(OIRSR_DEPTH, sf_overflow);
+
+// OIRSR 需要 Pipeline (PPL_LOOKUP) — 与 IRSR 共享!
+// 但 Pipeline 被 IRSR 占满时, OIRSR 阻塞
+// 简化: OIRSR 等待 Pipeline 可用 (通过 CtrlJoin 模拟)
+chan oirsr_out := Queue(PIPELINE_DEPTH, oirsr);
+
+// OIRSR back-invalidation 完成 → 释放 SF entry
+chan oi_done, oi_replay := Fork(oirsr_out);
+Sink(oi_done);
+Sink(oi_replay);

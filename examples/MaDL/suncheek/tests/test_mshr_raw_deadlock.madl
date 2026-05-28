@@ -1,0 +1,95 @@
+// ==========================================================================
+// 风险5: MSHR RAW Ordering + Data Channel 拥塞死锁
+// ==========================================================================
+//
+// Spec 来源: L3 Architecture §5.5 MSHR, §2.2 WriteNoSnp_Custom
+//
+// 场景:
+//   MSHR 确保 DDR 的 Read-After-Write 顺序:
+//     - 追踪 pending writes, 阻塞同地址后续 read 直到 write commit
+//
+//   死锁链:
+//   [1] L3 True Miss → 分配 IRSR entry → 需要 evict dirty cacheline
+//   [2] L3 Evict → WriteNoSnp_Custom → DDR (Data Channel)
+//   [3] MSHR 记录此 pending write (PA=X)
+//   [4] L3 发起 ReadNoSnp (PA=X) → DDR (Req/Snp Channel)
+//   [5] MSHR 阻塞此 read: 必须等 write commit 先完成
+//   [6] DDR write commit 需要 Data Channel 空间
+//   [7] Data Channel 被其他 L3 的 WriteNoSnp 和 CPU WriteBack 占满
+//   [8] 这些 WriteBack 源自的 IRSR entry 也在等 DDR read 响应
+//   [9] 但 read 被 MSHR 阻塞 → 循环!
+//
+// 模型结构:
+//   - Source(l3_evict) → Data Channel Queue → DDR write
+//   - DDR write 完成 → MSHR 释放 → 允许 read
+//   - Read 结果 → IRSR 释放 → 允许更多 evict
+//   - 如果 Data Channel 满 → evict 阻塞 → MSHR 不释放 → read 阻塞
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int DATA_CH_DEPTH = 2;     // Data Channel VoQ 深度
+param int IRSR_DEPTH = 2;
+param int MSHR_DEPTH = 1;        // MSHR: 1 entry (同地址)
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// 流量源
+// =====================================================================
+chan core_req := Source(tok);       // CPU → L3 请求
+
+// =====================================================================
+// IRSR: 处理 core 请求
+// =====================================================================
+chan irsr := Queue(IRSR_DEPTH, core_req);
+chan hit, miss := LoadBalancer(irsr);
+Sink(hit);
+
+// Miss → 需要 evict + read DDR
+chan evict_tok, read_tok := Fork(miss);
+
+// =====================================================================
+// Evict path: WriteNoSnp_Custom → DDR (Data Channel)
+// L3 Architecture §10.3: "L3 Overflow → WriteNoSnp_Custom to DDR"
+// =====================================================================
+
+// 其他 L3 的 evict 也在竞争 Data Channel
+chan other_evict := Source(tok);
+
+// Data Channel VoQ: 同时承载本 L3 evict 和其他 L3 evict
+chan evict_src := Source(tok);
+chan l3_evict_req := CtrlJoin(evict_src, evict_tok);
+
+chan data_ch := Queue(DATA_CH_DEPTH, Merge(l3_evict_req, other_evict_gated));
+
+// Credit 流控
+chan data_ch_out, data_consumed := Fork(data_ch);
+chan data_credit := CreditCounter(DATA_CH_DEPTH, data_consumed);
+chan other_evict_gated := CtrlJoin(other_evict, data_credit);
+
+// DDR 处理 write: 消费 + 生成 write_commit
+chan ddr_wr_sink, ddr_wr_commit := Fork(data_ch_out);
+Sink(ddr_wr_sink);
+
+// =====================================================================
+// MSHR: Read-After-Write ordering
+// L3 Architecture §5.5: "阻塞同地址 read 直到 write commit"
+// =====================================================================
+
+// MSHR 门控: read 必须等 write_commit
+chan mshr := Queue(MSHR_DEPTH, read_tok);
+chan read_allowed := CtrlJoin(mshr, ddr_wr_commit);
+
+// Read → DDR (通过独立通道, 如 Req/Snp Channel)
+chan read_result_src := Source(tok);
+chan read_result := CtrlJoin(read_result_src, read_allowed);
+
+// Read result → IRSR done (释放 entry)
+Sink(read_result);

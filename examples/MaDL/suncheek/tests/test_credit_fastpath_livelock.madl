@@ -1,0 +1,87 @@
+// ==========================================================================
+// 风险6: Credit Fast-Path 活锁
+// ==========================================================================
+//
+// Spec 来源: Router Spec §2.1.3, Line 349
+//
+// Spec 伪代码:
+//   assign has_credit = |credit | free_credit_vld;
+//
+//   always_ff @(posedge clk or negedge rst_n) begin
+//     if (!rst_n)
+//       credit <= CREDITS_INV;       // 初始 5
+//     else if (free_credit_vld && consume_credit_vld)
+//       credit <= credit;            // 同时收发: credit 不变
+//     else if (consume_credit_vld)
+//       credit <= credit - 1;
+//     else if (free_credit_vld)
+//       credit <= credit + 1;
+//   end
+//
+// 活锁场景:
+//   [1] Router R0 credit=0 toward R1
+//   [2] R1 释放一个 credit (free_credit_vld=1)
+//   [3] R0 同时发送一个 flit (consume_credit_vld=1)
+//   [4] credit <= credit (stays 0)
+//   [5] 下个 cycle, R0 credit=0 again
+//   [6] 如果 R1 也 credit=0, 两者交替 ping-pong
+//       每 cycle 只有一个方向发送一个 flit → 吞吐崩溃
+//
+// MaDL 建模:
+//   两个 Router 互相发送, 每个有 credit=1 (极小化)
+//   Fast-path: 即使 credit=0, 收到 consumed 信号时可发一个
+//   → 检测是否存在活锁 (两个 Source 交替阻塞)
+//
+// 注意: MaDL dlockdetect 的活锁检测可能报告此场景
+//       因为 Source 不是永久阻塞 (可间歇发送), 但吞吐极差
+//
+// 期望结果: NO DEADLOCK (Z3 UNSAT), 可能 LIVELOCK
+// ==========================================================================
+
+const tok;
+
+// 极小化参数: credit=1 模拟 fast-path 极限情况
+param int VOQ_DEPTH = 1;
+param int CREDIT_INIT = 1;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// Router R0 → R1 方向
+// =====================================================================
+chan r0_req := Source(tok);      // R0 持续发送请求
+
+// R0 出口 VoQ → R1 (credit-gated)
+chan voq_r0_to_r1 := Queue(VOQ_DEPTH, r0_gated);
+
+chan voq_r0_out, voq_r0_consumed := Fork(voq_r0_to_r1);
+chan credit_r0_to_r1 := CreditCounter(CREDIT_INIT, voq_r0_consumed);
+chan r0_gated := CtrlJoin(r0_req, credit_r0_to_r1);
+
+// =====================================================================
+// Router R1 → R0 方向
+// =====================================================================
+chan r1_req := Source(tok);      // R1 持续发送请求
+
+chan voq_r1_to_r0 := Queue(VOQ_DEPTH, r1_gated);
+
+chan voq_r1_out, voq_r1_consumed := Fork(voq_r1_to_r0);
+chan credit_r1_to_r0 := CreditCounter(CREDIT_INIT, voq_r1_consumed);
+chan r1_gated := CtrlJoin(r1_req, credit_r1_to_r0);
+
+// =====================================================================
+// R1 接收端: 消费 R0 发送的 flit
+// 消费 → 释放 credit 给 R0
+// =====================================================================
+chan r1_rx := Queue(VOQ_DEPTH, voq_r0_out);
+Sink(r1_rx);
+
+// =====================================================================
+// R0 接收端: 消费 R1 发送的 flit
+// =====================================================================
+chan r0_rx := Queue(VOQ_DEPTH, voq_r1_out);
+Sink(r0_rx);

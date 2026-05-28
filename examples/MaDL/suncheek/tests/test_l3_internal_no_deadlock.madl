@@ -1,0 +1,58 @@
+// ==========================================================================
+// 风险4B: L3 内部资源 — 独立 RX FIFO (修复验证)
+// ==========================================================================
+//
+// 修复:
+//   Request RX FIFO 和 Response RX FIFO 独立运行
+//   L3 Architecture §8.1:
+//     Request RX = 8 entry (72-bit)
+//     Response RX = 6 entry (35-bit)
+//
+//   即使 Request RX 阻塞 (IRSR 满 → 不消费新请求),
+//   Response RX 仍可独立消费 SnpResp/CompAck,
+//   使 IRSR 中等待响应的 entry 完成释放
+//
+// 期望结果: NO DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int IRSR_DEPTH = 2;
+param int PIPELINE_DEPTH = 1;
+param int REQ_FIFO_DEPTH = 2;
+param int RESP_FIFO_DEPTH = 2;
+
+// =====================================================================
+// 外部流量源
+// =====================================================================
+chan core_req := Source(tok);
+chan core_resp := Source(tok);
+
+// =====================================================================
+// 独立 RX FIFO — L3 §8.1 解决方案
+// =====================================================================
+
+// Request RX FIFO: 只接收 Core→L3 请求
+chan req_fifo := Queue(REQ_FIFO_DEPTH, core_req);
+
+// Response RX FIFO: 只接收 SnpResp/CompAck (独立!)
+chan resp_fifo := Queue(RESP_FIFO_DEPTH, core_resp);
+
+// =====================================================================
+// IRSR
+// =====================================================================
+chan irsr := Queue(IRSR_DEPTH, req_fifo);
+
+// Pipeline
+chan irsr_out := Queue(PIPELINE_DEPTH, irsr);
+chan ppl_hit, ppl_miss := LoadBalancer(irsr_out);
+Sink(ppl_hit);
+
+// Miss → WAIT_SNPRESP
+chan snp_tok, wait_snp_tok := Fork(ppl_miss);
+Sink(snp_tok);
+
+// 等待 SnpResp — 从独立的 Response FIFO 消费
+chan wait_resp_q := Queue(IRSR_DEPTH, wait_snp_tok);
+chan irsr_done := CtrlJoin(wait_resp_q, resp_fifo);
+Sink(irsr_done);

@@ -1,0 +1,132 @@
+// ==========================================================================
+// 风险4C: Response Channel CompAck/SnpResp/Comp 反压死锁
+// ==========================================================================
+//
+// Spec 来源: Router §3.4, L3 Architecture §6.2 (WAIT_COMPACK/WAIT_BOTH)
+//
+// 场景:
+//   Response Channel 承载 4 种 opcode (§3.4):
+//     - SnpResp  (RN→HN): Snoop 响应
+//     - CompAck  (RN→HN): 完成确认
+//     - Comp     (HN→RN): L3 完成通知
+//     - DBIDResp (HN→IO): 给 IO 的 DBID
+//
+//   双向流量共享同一 Response Channel 的 VoQ:
+//     HN→RN: Comp, DBIDResp
+//     RN→HN: SnpResp, CompAck
+//
+//   死锁链 (多 L3, 多 Cluster 场景):
+//   [1] L3_A 发 CompData → Cluster_X → IRSR 进入 WAIT_COMPACK
+//   [2] Cluster_X 需要发 CompAck → L3_A (Resp Channel)
+//   [3] Resp Channel VoQ toward L3_A 满 (被 SnpResp 占据)
+//   [4] L3_A 的 Resp RX FIFO 满 (被其他 SnpResp 占据)
+//   [5] L3_A 正在处理这些 SnpResp 的 IRSR entry → 在 WAIT_COMPACK
+//   [6] 这些 WAIT_COMPACK 需要 CompAck → 从 Cluster_Y
+//   [7] Cluster_Y 的 CompAck 也在 Resp VoQ 中等待
+//       → 循环!
+//
+// 简化模型:
+//   2 个 L3 (HN) + 2 个 Cluster (RN)
+//   Response Channel 同一 VoQ 承载 Comp(HN→RN) 和 CompAck(RN→HN)
+//
+// 期望结果: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int RESP_VOQ_DEPTH = 2;   // Resp Channel VoQ = 2 flit (§2.1.1)
+param int RESP_RX_DEPTH = 2;    // L3 Resp RX FIFO (简化)
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// L3_A (HN) 和 L3_B (HN) 互相向对方的 Cluster 发 Comp
+// Cluster_A (RN) 和 Cluster_B (RN) 互相回 CompAck
+// =====================================================================
+
+// L3_A 发送 Comp → Cluster_B (eastbound Resp VoQ)
+chan l3a_comp := Source(tok);
+
+// L3_B 发送 Comp → Cluster_A (westbound Resp VoQ)
+chan l3b_comp := Source(tok);
+
+// Cluster_A 发送 CompAck → L3_B (eastbound Resp VoQ)
+// 注: CompAck 是对 L3_B 发来的 CompData 的确认
+chan cluster_a_ack := Source(tok);
+
+// Cluster_B 发送 CompAck → L3_A (westbound Resp VoQ)
+chan cluster_b_ack := Source(tok);
+
+// =====================================================================
+// Eastbound Resp VoQ — 同时承载 Comp(L3_A→ClusterB) + CompAck(ClusterA→L3_B)
+// Router §2.1.1: Resp Channel 只有 Dedicated VoQ
+// =====================================================================
+chan resp_voq_e := Queue(RESP_VOQ_DEPTH, Merge(l3a_comp_gated, cluster_a_ack_gated));
+
+chan resp_voq_e_out, resp_voq_e_consumed := Fork(resp_voq_e);
+chan credit_e := CreditCounter(RESP_VOQ_DEPTH, resp_voq_e_consumed);
+
+// 两种流量共享 credit pool
+chan credit_e_comp, credit_e_ack := Fork(credit_e);
+chan l3a_comp_gated := CtrlJoin(l3a_comp, credit_e_comp);
+chan cluster_a_ack_gated := CtrlJoin(cluster_a_ack, credit_e_ack);
+
+// 路由: 到 Cluster_B 或 L3_B
+chan to_cluster_b, to_l3b := LoadBalancer(resp_voq_e_out);
+
+// =====================================================================
+// Westbound Resp VoQ
+// =====================================================================
+chan resp_voq_w := Queue(RESP_VOQ_DEPTH, Merge(l3b_comp_gated, cluster_b_ack_gated));
+
+chan resp_voq_w_out, resp_voq_w_consumed := Fork(resp_voq_w);
+chan credit_w := CreditCounter(RESP_VOQ_DEPTH, resp_voq_w_consumed);
+
+chan credit_w_comp, credit_w_ack := Fork(credit_w);
+chan l3b_comp_gated := CtrlJoin(l3b_comp, credit_w_comp);
+chan cluster_b_ack_gated := CtrlJoin(cluster_b_ack, credit_w_ack);
+
+chan to_cluster_a, to_l3a := LoadBalancer(resp_voq_w_out);
+
+// =====================================================================
+// Cluster_B — 接收 Comp, 需要发回 CompAck
+// =====================================================================
+chan cb_irsr := Queue(IRSR_DEPTH, to_cluster_b);
+// 收到 Comp → 生成 CompAck 响应 (westbound)
+chan cb_comp_done, cb_ack_trigger := Fork(cb_irsr);
+Sink(cb_comp_done);
+
+// CompAck 需要通过 westbound VoQ 发出
+// 但 westbound VoQ 可能被 L3_B 的 Comp 占满!
+chan cb_ack_src := Source(tok);
+chan cluster_b_ack_out := CtrlJoin(cb_ack_src, cb_ack_trigger);
+Sink(cluster_b_ack_out);
+
+// =====================================================================
+// Cluster_A — 接收 Comp, 需要发回 CompAck
+// =====================================================================
+chan ca_irsr := Queue(IRSR_DEPTH, to_cluster_a);
+chan ca_comp_done, ca_ack_trigger := Fork(ca_irsr);
+Sink(ca_comp_done);
+
+chan ca_ack_src := Source(tok);
+chan cluster_a_ack_out := CtrlJoin(ca_ack_src, ca_ack_trigger);
+Sink(cluster_a_ack_out);
+
+// =====================================================================
+// L3_A — 接收 CompAck (从 Cluster_B)
+// WAIT_COMPACK 状态: 必须收到 CompAck 才能释放 IRSR entry
+// =====================================================================
+chan l3a_wait := Queue(IRSR_DEPTH, to_l3a);
+Sink(l3a_wait);    // CompAck 到达 → IRSR entry 释放
+
+// =====================================================================
+// L3_B — 接收 CompAck (从 Cluster_A)
+// =====================================================================
+chan l3b_wait := Queue(IRSR_DEPTH, to_l3b);
+Sink(l3b_wait);
