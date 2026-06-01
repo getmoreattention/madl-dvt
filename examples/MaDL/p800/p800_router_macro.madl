@@ -1,0 +1,275 @@
+// ==========================================================================
+// P800 Router - xMAS Macro Primitive Library
+// ==========================================================================
+//
+// Source: P800_ROUTER_HAS_08.md (HAS v0.8)
+//
+// Reusable MaDL macros for P800 Router mesh topology composition.
+//
+// ========================== Spec Key Parameters ==========================
+//
+// Ports:     E(0), S(1), W(2), N(3), L0(4), L1(5), up to 6 directions
+// VoQ:      depth = 5 flit per VoQ
+// Credit:   initial = 5, no fast-path (1.1)
+// Routing:  Y-X (vertical first, then horizontal, 2.2.1)
+// Arbiter:  Round Robin (2.4)
+// Pipeline: 2-stage (Stage0 Input + Stage1 Output)
+// Features: Store-and-forward, separate VC, 1-cycle latency
+//           Back-to-back throughput, in-order same-path, no loop-back
+//
+// ========================== Separate VC Credit (2.3.2) ====================
+//
+// Output Port Dir  | Downstream VoQ Dirs      | Credit Counter Count
+// E (non-edge)     | E/L0/L1                  | 3
+// W (non-edge)     | W/L0/L1                  | 3
+// S                | W/E/S/L0/L1              | 5
+// N                | W/E/N/L0/L1              | 5
+// E (edge)         | N/S/E/L0/L1              | 5
+// W (edge)         | N/S/W/L0/L1              | 5
+//
+// ========================== Design Pattern ================================
+//
+// Credit control is NOT inside macros (matching deterministicBubble ref).
+// Macros only contain: Input VoQ + Routing + Output Merge.
+// Credit is applied EXTERNALLY when connecting routers.
+//
+// ==========================================================================
+
+const tok;
+
+param int VOQ_DEPTH = 5;       // 2.1.1 VoQ depth
+param int CREDIT_INIT = 5;     // 2.1.1 = VOQ_DEPTH
+
+// ==========================================================================
+// CreditCounter (2.3.1)
+//
+// Hardware mapping:
+//   initial credit = n (VoQ depth)
+//   consume: send flit, credit-1
+//   free:    downstream releases slot, credit+1
+//   has_credit = (credit != 0)
+// ==========================================================================
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// ==========================================================================
+// P800Router_EW: East-West bidirectional Router (minimal unit)
+//
+// ins[0]=rx_e, ins[1]=rx_w
+// outs[0]=tx_e (W-to-E path), outs[1]=tx_w (E-to-W path)
+//
+// 1.2: No loop-back. E input can only go W, W input can only go E.
+// 2.1: VoQ buffer = Queue(VOQ_DEPTH)
+// ==========================================================================
+macro P800Router_EW(bus<2> ins) => bus<2> outs {
+    // W Input -> VoQ -> E Output
+    let outs[0] := Queue(VOQ_DEPTH, ins[1]);
+    // E Input -> VoQ -> W Output
+    let outs[1] := Queue(VOQ_DEPTH, ins[0]);
+};
+
+// ==========================================================================
+// P800Router_EW_L2: East-West + 2 Local ports Router
+//
+// ins[0]=rx_e, ins[1]=rx_w, ins[2]=rx_l0, ins[3]=rx_l1
+// outs[0]=tx_e, outs[1]=tx_w, outs[2]=tx_l0, outs[3]=tx_l1
+//
+// VoQ config (2.3.2):
+//   E Input (non-edge): 3 VoQ (W/L0/L1)
+//   W Input (non-edge): 3 VoQ (E/L0/L1)
+//   L0 Input: 2 VoQ (E/W)
+//   L1 Input: 2 VoQ (E/W)
+//
+// Output Port arbitration (2.4 RR):
+//   E Output: Merge(W-to-E, L0-to-E, L1-to-E)
+//   W Output: Merge(E-to-W, L0-to-W, L1-to-W)
+//   L0 Output: Merge(E-to-L0, W-to-L0)
+//   L1 Output: Merge(E-to-L1, W-to-L1)
+// ==========================================================================
+macro P800Router_EW_L2(bus<4> ins) => bus<4> outs {
+
+    // === E Input Port: can go W/L0/L1 (3 VoQ) ===
+    chan e_to_w, e_to_local := LoadBalancer(ins[0]);
+    chan e_to_l0, e_to_l1 := LoadBalancer(e_to_local);
+    chan voq_e_w  := Queue(VOQ_DEPTH, e_to_w);
+    chan voq_e_l0 := Queue(VOQ_DEPTH, e_to_l0);
+    chan voq_e_l1 := Queue(VOQ_DEPTH, e_to_l1);
+
+    // === W Input Port: can go E/L0/L1 (3 VoQ) ===
+    chan w_to_e, w_to_local := LoadBalancer(ins[1]);
+    chan w_to_l0, w_to_l1 := LoadBalancer(w_to_local);
+    chan voq_w_e  := Queue(VOQ_DEPTH, w_to_e);
+    chan voq_w_l0 := Queue(VOQ_DEPTH, w_to_l0);
+    chan voq_w_l1 := Queue(VOQ_DEPTH, w_to_l1);
+
+    // === L0 Input Port: can go E/W ===
+    chan l0_to_e, l0_to_w := LoadBalancer(ins[2]);
+    chan voq_l0_e := Queue(VOQ_DEPTH, l0_to_e);
+    chan voq_l0_w := Queue(VOQ_DEPTH, l0_to_w);
+
+    // === L1 Input Port: can go E/W ===
+    chan l1_to_e, l1_to_w := LoadBalancer(ins[3]);
+    chan voq_l1_e := Queue(VOQ_DEPTH, l1_to_e);
+    chan voq_l1_w := Queue(VOQ_DEPTH, l1_to_w);
+
+    // === E Output: RR(W-to-E, L0-to-E, L1-to-E) ===
+    let outs[0] := Merge(Merge(voq_w_e, voq_l0_e), voq_l1_e);
+
+    // === W Output: RR(E-to-W, L0-to-W, L1-to-W) ===
+    let outs[1] := Merge(Merge(voq_e_w, voq_l0_w), voq_l1_w);
+
+    // === L0 Output: RR(E-to-L0, W-to-L0) ===
+    let outs[2] := Merge(voq_e_l0, voq_w_l0);
+
+    // === L1 Output: RR(E-to-L1, W-to-L1) ===
+    let outs[3] := Merge(voq_e_l1, voq_w_l1);
+};
+
+// ==========================================================================
+// P800Router_4DIR: 4-direction Router (E/S/W/N, no local ports)
+//
+// ins[0]=rx_e, ins[1]=rx_s, ins[2]=rx_w, ins[3]=rx_n
+// outs[0]=tx_e, outs[1]=tx_s, outs[2]=tx_w, outs[3]=tx_n
+//
+// Y-X routing (2.2.1):
+//   N/S input can turn to E/W (Y-to-X turn)
+//   E/W input stays in X dimension (no turn back to Y)
+//
+// VoQ config:
+//   E Input (non-edge): goes to W only (Y-X constraint)
+//   W Input (non-edge): goes to E only
+//   S Input: goes to W/E/N (Y-to-X turn)
+//   N Input: goes to W/E/S (Y-to-X turn)
+// ==========================================================================
+macro P800Router_4DIR(bus<4> ins) => bus<4> outs {
+
+    // === E Input: only to W (no loop-back, Y-X: already in X dim) ===
+    chan voq_e_w := Queue(VOQ_DEPTH, ins[0]);
+
+    // === W Input: only to E ===
+    chan voq_w_e := Queue(VOQ_DEPTH, ins[2]);
+
+    // === S Input: to N/E/W (Y-to-X turn possible) ===
+    chan s_to_n, s_to_ew := LoadBalancer(ins[1]);
+    chan s_to_e, s_to_w := LoadBalancer(s_to_ew);
+    chan voq_s_n := Queue(VOQ_DEPTH, s_to_n);
+    chan voq_s_e := Queue(VOQ_DEPTH, s_to_e);
+    chan voq_s_w := Queue(VOQ_DEPTH, s_to_w);
+
+    // === N Input: to S/E/W (Y-to-X turn possible) ===
+    chan n_to_s, n_to_ew := LoadBalancer(ins[3]);
+    chan n_to_e, n_to_w := LoadBalancer(n_to_ew);
+    chan voq_n_s := Queue(VOQ_DEPTH, n_to_s);
+    chan voq_n_e := Queue(VOQ_DEPTH, n_to_e);
+    chan voq_n_w := Queue(VOQ_DEPTH, n_to_w);
+
+    // === E Output: Merge(W-to-E, S-to-E, N-to-E) ===
+    let outs[0] := Merge(Merge(voq_w_e, voq_s_e), voq_n_e);
+
+    // === S Output: N-to-S only (Y-X: only N can go S) ===
+    let outs[1] := Queue(1, voq_n_s);
+
+    // === W Output: Merge(E-to-W, S-to-W, N-to-W) ===
+    let outs[2] := Merge(Merge(voq_e_w, voq_s_w), voq_n_w);
+
+    // === N Output: S-to-N only (Y-X: only S can go N) ===
+    let outs[3] := Queue(1, voq_s_n);
+};
+
+// ==========================================================================
+// P800Router_Full: Complete 6-port Router (E/S/W/N/L0/L1)
+//
+// ins[0]=rx_e, ins[1]=rx_s, ins[2]=rx_w, ins[3]=rx_n, ins[4]=rx_l0, ins[5]=rx_l1
+// outs[0]=tx_e, outs[1]=tx_s, outs[2]=tx_w, outs[3]=tx_n, outs[4]=tx_l0, outs[5]=tx_l1
+//
+// VoQ config per 2.3.2 Separate VC Credit table:
+//   E (non-edge): W/L0/L1           = 3 VoQ
+//   W (non-edge): E/L0/L1           = 3 VoQ
+//   S:            W/E/N/L0/L1       = 5 VoQ
+//   N:            W/E/S/L0/L1       = 5 VoQ
+//   L0:           E/S/W/N           = 4 VoQ
+//   L1:           E/S/W/N           = 4 VoQ
+// ==========================================================================
+macro P800Router_Full(bus<6> ins) => bus<6> outs {
+
+    // === E Input: to W/L0/L1 (3 VoQ, non-edge) ===
+    chan e_to_w, e_to_l := LoadBalancer(ins[0]);
+    chan e_to_l0, e_to_l1 := LoadBalancer(e_to_l);
+    chan voq_e_w  := Queue(VOQ_DEPTH, e_to_w);
+    chan voq_e_l0 := Queue(VOQ_DEPTH, e_to_l0);
+    chan voq_e_l1 := Queue(VOQ_DEPTH, e_to_l1);
+
+    // === W Input: to E/L0/L1 (3 VoQ) ===
+    chan w_to_e, w_to_l := LoadBalancer(ins[2]);
+    chan w_to_l0, w_to_l1 := LoadBalancer(w_to_l);
+    chan voq_w_e  := Queue(VOQ_DEPTH, w_to_e);
+    chan voq_w_l0 := Queue(VOQ_DEPTH, w_to_l0);
+    chan voq_w_l1 := Queue(VOQ_DEPTH, w_to_l1);
+
+    // === S Input: to W/E/N/L0/L1 (5 VoQ) ===
+    chan s_dir, s_local := LoadBalancer(ins[1]);
+    chan s_to_w, s_to_en := LoadBalancer(s_dir);
+    chan s_to_e, s_to_n := LoadBalancer(s_to_en);
+    chan s_to_l0, s_to_l1 := LoadBalancer(s_local);
+    chan voq_s_w  := Queue(VOQ_DEPTH, s_to_w);
+    chan voq_s_e  := Queue(VOQ_DEPTH, s_to_e);
+    chan voq_s_n  := Queue(VOQ_DEPTH, s_to_n);
+    chan voq_s_l0 := Queue(VOQ_DEPTH, s_to_l0);
+    chan voq_s_l1 := Queue(VOQ_DEPTH, s_to_l1);
+
+    // === N Input: to W/E/S/L0/L1 (5 VoQ) ===
+    chan n_dir, n_local := LoadBalancer(ins[3]);
+    chan n_to_w, n_to_es := LoadBalancer(n_dir);
+    chan n_to_e, n_to_s := LoadBalancer(n_to_es);
+    chan n_to_l0, n_to_l1 := LoadBalancer(n_local);
+    chan voq_n_w  := Queue(VOQ_DEPTH, n_to_w);
+    chan voq_n_e  := Queue(VOQ_DEPTH, n_to_e);
+    chan voq_n_s  := Queue(VOQ_DEPTH, n_to_s);
+    chan voq_n_l0 := Queue(VOQ_DEPTH, n_to_l0);
+    chan voq_n_l1 := Queue(VOQ_DEPTH, n_to_l1);
+
+    // === L0 Input: to E/S/W/N (4 VoQ) ===
+    chan l0_ew, l0_ns := LoadBalancer(ins[4]);
+    chan l0_to_e, l0_to_w := LoadBalancer(l0_ew);
+    chan l0_to_n, l0_to_s := LoadBalancer(l0_ns);
+    chan voq_l0_e := Queue(VOQ_DEPTH, l0_to_e);
+    chan voq_l0_w := Queue(VOQ_DEPTH, l0_to_w);
+    chan voq_l0_n := Queue(VOQ_DEPTH, l0_to_n);
+    chan voq_l0_s := Queue(VOQ_DEPTH, l0_to_s);
+
+    // === L1 Input: to E/S/W/N (4 VoQ) ===
+    chan l1_ew, l1_ns := LoadBalancer(ins[5]);
+    chan l1_to_e, l1_to_w := LoadBalancer(l1_ew);
+    chan l1_to_n, l1_to_s := LoadBalancer(l1_ns);
+    chan voq_l1_e := Queue(VOQ_DEPTH, l1_to_e);
+    chan voq_l1_w := Queue(VOQ_DEPTH, l1_to_w);
+    chan voq_l1_n := Queue(VOQ_DEPTH, l1_to_n);
+    chan voq_l1_s := Queue(VOQ_DEPTH, l1_to_s);
+
+    // === Output Ports: Merge (RR Arbitration 2.4) ===
+
+    // E Output: from W/S/N/L0/L1
+    let outs[0] := Merge(Merge(voq_w_e, voq_s_e),
+                         Merge(Merge(voq_n_e, voq_l0_e), voq_l1_e));
+
+    // S Output: from N/L0/L1 (Y-X: E/W cannot go S)
+    let outs[1] := Merge(Merge(voq_n_s, voq_l0_s), voq_l1_s);
+
+    // W Output: from E/S/N/L0/L1
+    let outs[2] := Merge(Merge(voq_e_w, voq_s_w),
+                         Merge(Merge(voq_n_w, voq_l0_w), voq_l1_w));
+
+    // N Output: from S/L0/L1 (Y-X: E/W cannot go N)
+    let outs[3] := Merge(Merge(voq_s_n, voq_l0_n), voq_l1_n);
+
+    // L0 Output: from E/W/S/N
+    let outs[4] := Merge(Merge(voq_e_l0, voq_w_l0),
+                         Merge(voq_s_l0, voq_n_l0));
+
+    // L1 Output: from E/W/S/N
+    let outs[5] := Merge(Merge(voq_e_l1, voq_w_l1),
+                         Merge(voq_s_l1, voq_n_l1));
+};

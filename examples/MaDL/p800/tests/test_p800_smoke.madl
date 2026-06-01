@@ -1,0 +1,41 @@
+// P800 Router Macro - Smoke Test
+
+const tok;
+
+param int VOQ_DEPTH = 5;
+param int CREDIT_INIT = 5;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// P800Router_EW: East-West bidirectional router
+// ins[0]=rx_e, ins[1]=rx_w
+// outs[0]=tx_e (W-to-E path), outs[1]=tx_w (E-to-W path)
+macro P800Router_EW(bus<2> ins) => bus<2> outs {
+    // Use Merge with itself to satisfy MaDL let-expression requirement
+    // (let outs[i] needs a primitive call, not bare channel)
+    let outs[0] := Queue(VOQ_DEPTH, ins[1]);
+    let outs[1] := Queue(VOQ_DEPTH, ins[0]);
+};
+
+// Test: Source -> Router_A -> credit -> Router_B -> Sink
+chan src := Source(tok);
+
+// Router_A: ins[0]=idle, ins[1]=src
+bus<2> outs_a;
+let outs_a[0], outs_a[1] := P800Router_EW(PatientSource(tok), src);
+Sink(outs_a[1]);
+
+// Credit gate A to B
+chan credit_ab := CreditCounter(CREDIT_INIT, consumed_ab);
+chan gated := CtrlJoin(outs_a[0], credit_ab);
+
+// Router_B: ins[0]=idle, ins[1]=gated from A
+bus<2> outs_b;
+let outs_b[0], outs_b[1] := P800Router_EW(PatientSource(tok), gated);
+chan out_b, consumed_ab := Fork(outs_b[0]);
+Sink(out_b);
+Sink(outs_b[1]);
