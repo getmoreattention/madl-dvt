@@ -1,0 +1,72 @@
+// ==========================================================================
+// F03: Flit-Level Reassembly Deadlock (3 Sources, 2 DPB Slots)
+// ==========================================================================
+//
+// The critical new scenario at flit level:
+//   Multiple sources send multi-flit packets to the same destination.
+//   Flits can be stored non-contiguously (interleaved).
+//   ALL flits of a packet must arrive before the transaction completes.
+//
+// Model:
+//   3 sources each produce 2-flit packets (simplified for SMT)
+//   Shared RX buffer = 4 flit
+//   DPB has only 2 reassembly slots
+//
+// Deadlock scenario:
+//   [1] Source A: 1 flit in DPB slot 1 (needs 1 more)
+//   [2] Source B: 1 flit in DPB slot 2 (needs 1 more)
+//   [3] Source C: 2 flits in RX FIFO (no DPB slot available!)
+//   [4] RX FIFO full (4 flit: 1+1+2)
+//   [5] A/B's 2nd flit can't enter RX FIFO → DPB slots never complete
+//   [6] DPB never drains → RX FIFO never drains → DEADLOCK
+//
+// Expected: DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int RX_DEPTH = 4;    // Shared RX buffer depth (flit)
+param int DPB_DEPTH = 2;   // Only 2 reassembly slots
+
+// =====================================================================
+// 3 sources, each producing 2 flits per packet
+// =====================================================================
+chan a0 := Source(tok);
+chan a1 := Source(tok);
+
+chan b0 := Source(tok);
+chan b1 := Source(tok);
+
+chan c0 := Source(tok);
+chan c1 := Source(tok);
+
+// =====================================================================
+// Shared RX FIFO (4 flit): all 6 flit sources compete
+// Queue backpressure provides flow control
+// =====================================================================
+chan rx := Queue(RX_DEPTH, Merge(Merge(a0, a1), Merge(Merge(b0, b1), Merge(c0, c1))));
+
+// =====================================================================
+// DPB: 2 reassembly slots
+// LoadBalancer routes flits to one of 2 slots
+// Each slot blocks when full → FIFO blocks → upstream blocks
+// =====================================================================
+chan to_dpb_a, to_dpb_b := LoadBalancer(rx);
+
+chan dpb_a := Queue(DPB_DEPTH, to_dpb_a);
+chan dpb_b := Queue(DPB_DEPTH, to_dpb_b);
+
+// =====================================================================
+// IRSR: processes completed reassemblies
+// Limited depth creates backpressure on DPB
+// =====================================================================
+chan irsr := Queue(2, Merge(dpb_a, dpb_b));
+chan completed, need_action := LoadBalancer(irsr);
+Sink(completed);
+
+// Action path requires downstream response
+chan action_tok, wait_tok := Fork(need_action);
+Sink(wait_tok);
+chan resp := Queue(1, PatientSource(tok));
+chan done := CtrlJoin(action_tok, resp);
+Sink(done);

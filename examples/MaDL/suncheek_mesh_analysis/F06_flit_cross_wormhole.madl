@@ -1,0 +1,131 @@
+// ==========================================================================
+// F06: Two 4-Flit Packets Crossing at Router — Wormhole Deadlock
+// ==========================================================================
+//
+// Spec source:
+//   §2.1.1: VoQ depth = 2 flit
+//   §2.1.3: Credit = 5
+//   §5.2: Cacheline = 64B = 2 flit, large packets up to 9 flit
+//
+// Scenario:
+//   Packet A (4 flit) heading east → enters VoQ_East(2)
+//   Packet B (4 flit) heading west → enters VoQ_West(2)
+//   Each direction has credit = 5
+//   + 2 response flits per direction (6 total sources per VoQ)
+//
+//   Mutual dependency:
+//     East RX (Cluster_B) processes packet A → miss → needs west response
+//     West RX (Cluster_A) processes packet B → miss → needs east response
+//     Both VoQs clogged → neither response can pass → deadlock
+//
+// Note: Production max = 9 flit. 4 flit used for SMT tractability.
+//       4 flit > VoQ(2) already creates the capacity mismatch needed
+//       for wormhole blocking. 9 flit makes it strictly worse.
+//
+// Expected result: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int VOQ_FLIT = 2;
+param int CREDIT_FLIT = 5;
+param int RX_FLIT = 4;
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// Eastbound: Packet A (4 flit) + response flits from Cluster_A
+// 6 sources sharing east VoQ
+// =====================================================================
+chan ea_f0 := Source(tok);
+chan ea_f1 := Source(tok);
+chan ea_f2 := Source(tok);
+chan ea_f3 := Source(tok);
+chan ea_resp0 := Source(tok);
+chan ea_resp1 := Source(tok);
+
+chan voq_e_in := Merge(Merge(Merge(ea_f0_g, ea_f1_g), Merge(ea_f2_g, ea_f3_g)),
+                       Merge(ea_resp0_g, ea_resp1_g));
+
+chan voq_e := Queue(VOQ_FLIT, voq_e_in);
+chan voq_e_out, voq_e_consumed := Fork(voq_e);
+chan credit_e := CreditCounter(CREDIT_FLIT, voq_e_consumed);
+
+// 6-way Fork chain
+chan ce0, ce_r1 := Fork(credit_e);
+chan ce1, ce_r2 := Fork(ce_r1);
+chan ce2, ce_r3 := Fork(ce_r2);
+chan ce3, ce_r4 := Fork(ce_r3);
+chan ce4, ce5 := Fork(ce_r4);
+
+chan ea_f0_g := CtrlJoin(ea_f0, ce0);
+chan ea_f1_g := CtrlJoin(ea_f1, ce1);
+chan ea_f2_g := CtrlJoin(ea_f2, ce2);
+chan ea_f3_g := CtrlJoin(ea_f3, ce3);
+chan ea_resp0_g := CtrlJoin(ea_resp0, ce4);
+chan ea_resp1_g := CtrlJoin(ea_resp1, ce5);
+
+// =====================================================================
+// Westbound: Packet B (4 flit) + response flits from Cluster_B
+// 6 sources sharing west VoQ
+// =====================================================================
+chan wb_f0 := Source(tok);
+chan wb_f1 := Source(tok);
+chan wb_f2 := Source(tok);
+chan wb_f3 := Source(tok);
+chan wb_resp0 := Source(tok);
+chan wb_resp1 := Source(tok);
+
+chan voq_w_in := Merge(Merge(Merge(wb_f0_g, wb_f1_g), Merge(wb_f2_g, wb_f3_g)),
+                       Merge(wb_resp0_g, wb_resp1_g));
+
+chan voq_w := Queue(VOQ_FLIT, voq_w_in);
+chan voq_w_out, voq_w_consumed := Fork(voq_w);
+chan credit_w := CreditCounter(CREDIT_FLIT, voq_w_consumed);
+
+// 6-way Fork chain
+chan cw0, cw_r1 := Fork(credit_w);
+chan cw1, cw_r2 := Fork(cw_r1);
+chan cw2, cw_r3 := Fork(cw_r2);
+chan cw3, cw_r4 := Fork(cw_r3);
+chan cw4, cw5 := Fork(cw_r4);
+
+chan wb_f0_g := CtrlJoin(wb_f0, cw0);
+chan wb_f1_g := CtrlJoin(wb_f1, cw1);
+chan wb_f2_g := CtrlJoin(wb_f2, cw2);
+chan wb_f3_g := CtrlJoin(wb_f3, cw3);
+chan wb_resp0_g := CtrlJoin(wb_resp0, cw4);
+chan wb_resp1_g := CtrlJoin(wb_resp1, cw5);
+
+// =====================================================================
+// Cluster_B (East): receives Packet A flits from east VoQ
+// =====================================================================
+chan voq_e_to_cb, voq_e_to_ca_resp := Fork(voq_e_out);
+
+chan cb_rx := Queue(RX_FLIT, voq_e_to_cb);
+chan cb_irsr := Queue(IRSR_DEPTH, cb_rx);
+chan cb_hit, cb_miss := LoadBalancer(cb_irsr);
+Sink(cb_hit);
+
+chan voq_w_to_cb, voq_w_to_ca := Fork(voq_w_out);
+
+// Miss → needs westbound response → depends on west VoQ (blocked by Pkt B)
+chan cb_wait := CtrlJoin(cb_miss, voq_w_to_cb);
+Sink(cb_wait);
+
+// =====================================================================
+// Cluster_A (West): receives Packet B flits from west VoQ
+// =====================================================================
+chan ca_rx := Queue(RX_FLIT, voq_w_to_ca);
+chan ca_irsr := Queue(IRSR_DEPTH, ca_rx);
+chan ca_hit, ca_miss := LoadBalancer(ca_irsr);
+Sink(ca_hit);
+
+// Miss → needs eastbound response → depends on east VoQ (blocked by Pkt A)
+chan ca_wait := CtrlJoin(ca_miss, voq_e_to_ca_resp);
+Sink(ca_wait);

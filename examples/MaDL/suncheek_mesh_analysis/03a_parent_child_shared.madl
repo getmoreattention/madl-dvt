@@ -1,0 +1,85 @@
+// Suncheek Mesh Analysis - Model 03a: Parent-Child Shared VoQ
+//
+// ALL traffic (CPU requests, L3 child requests, DDR responses)
+// goes through the SAME shared fabric queue.
+// This models the condition where Parent and Child compete for
+// the same VoQ resources, creating a circular dependency:
+//   CPU fills shared queue → L3 can't send child req → DDR can't respond → L3 blocks → deadlock
+//
+// Expected: DEADLOCK
+
+param int QSIZE = 2;
+param int IRSR_DEPTH = 2;
+
+const tok;
+
+uses lib.suncheek_l3;
+
+// =====================================================================
+// CPU Sources (4 clusters in a 2x2 mesh)
+// =====================================================================
+chan cpu00 := Source(tok)[cpu00_src];
+chan cpu10 := Source(tok)[cpu10_src];
+chan cpu01 := Source(tok)[cpu01_src];
+chan cpu11 := Source(tok)[cpu11_src];
+
+// =====================================================================
+// L3 Instances
+// Forward-referenced channels (l3_XX_in, l3_XX_ddr) are bound later.
+// MADL resolves these forward references automatically.
+// =====================================================================
+chan l3_00_resp, l3_00_child := SuncheekL3(IRSR_DEPTH, l3_00_in, l3_00_ddr)[l3_00];
+chan l3_10_resp, l3_10_child := SuncheekL3(IRSR_DEPTH, l3_10_in, l3_10_ddr)[l3_10];
+chan l3_01_resp, l3_01_child := SuncheekL3(IRSR_DEPTH, l3_01_in, l3_01_ddr)[l3_01];
+chan l3_11_resp, l3_11_child := SuncheekL3(IRSR_DEPTH, l3_11_in, l3_11_ddr)[l3_11];
+
+// Consume L3 responses (CPU receives data)
+Sink(l3_00_resp)[sink_r00];
+Sink(l3_10_resp)[sink_r10];
+Sink(l3_01_resp)[sink_r01];
+Sink(l3_11_resp)[sink_r11];
+
+// =====================================================================
+// SHARED FABRIC: CPU + Child + DDR responses all in ONE queue
+// This is the deadlock source — all traffic classes compete for
+// the same buffer space.
+// =====================================================================
+
+// Merge all CPU requests
+chan cpu_all := Merge(cpu00, Merge(cpu10, Merge(cpu01, cpu11)));
+
+// Merge all L3 child requests (ReadNoSnp to DDR)
+chan child_all := Merge(l3_00_child, Merge(l3_10_child, Merge(l3_01_child, l3_11_child)));
+
+// DDR response source (generated when DDR processes a child request)
+// Goes BACK into shared fabric — this creates the circular dependency
+chan ddr_resp_gen := Source(tok)[ddr_resp_src];
+
+// ALL traffic through ONE shared fabric queue
+chan all_in := Merge(cpu_all, Merge(child_all, ddr_resp_gen));
+chan fabric := Queue(QSIZE, all_in)[sharedFabric];
+
+// =====================================================================
+// Route from fabric: 4 L3 destinations + DDR
+// LoadBalancer models non-deterministic routing to any destination
+// =====================================================================
+chan to_ddr, to_l3s := LoadBalancer(fabric)[lb_main];
+chan to_l3_0x, to_l3_1x := LoadBalancer(to_l3s)[lb_row];
+chan l3_00_in, l3_10_in := LoadBalancer(to_l3_0x)[lb_00];
+chan l3_01_in, l3_11_in := LoadBalancer(to_l3_1x)[lb_01];
+
+// DDR: consume child requests that reach it
+Sink(to_ddr)[ddr_req_sink];
+
+// =====================================================================
+// DDR responses back to L3
+// Each L3 has a small response queue from DDR.
+// In this model, DDR responses are modeled as PatientSources
+// (DDR responds when it can, not blocking = normal).
+// The deadlock arises because child requests through the shared
+// fabric are blocked by CPU traffic, not because DDR can't respond.
+// =====================================================================
+chan l3_00_ddr := Queue(1, PatientSource(tok))[ddr00];
+chan l3_10_ddr := Queue(1, PatientSource(tok))[ddr10];
+chan l3_01_ddr := Queue(1, PatientSource(tok))[ddr01];
+chan l3_11_ddr := Queue(1, PatientSource(tok))[ddr11];

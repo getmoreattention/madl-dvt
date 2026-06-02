@@ -1,0 +1,60 @@
+// ==========================================================================
+// L01: L3 Internal Protocol — Separated DATA FIFOs (Baseline)
+// ==========================================================================
+//
+// Single L3 node with local DDR turnaround.
+// Tests that L3 internal multi-channel logic is deadlock-free when
+// DATA channel FIFOs are properly separated (is_sn bit discrimination).
+//
+// Architecture modeled:
+//   REQ channel:  Source → req_in → IRSR → hit/miss
+//   DATA channel: WB (Source, wb_k only) → separated wb_fifo → WBQ → Sink
+//                 DDR resp (generated from miss) → separated resp_fifo → IRSR completion
+//   SNP channel:  child DDR request (SnpReadNoSnp_Custom) exits L3
+//   DDR turnaround: child → Queue(1) → DDR resp (local, no cross-node dependency)
+//
+// Expected: NO DEADLOCK (single node, separated FIFOs, local DDR turnaround)
+// ==========================================================================
+
+uses lib.suncheek_l3_multi;
+
+enum DKind { wb_k, resp_k };
+struct DFlit { kind : DKind; };
+pred IsWB (p: DFlit) { p.kind == wb_k };
+
+param int IRSR_DEPTH    = 4;
+param int WBQ_DEPTH     = 4;
+param int RX_WR_DEPTH   = 8;
+param int RX_RESP_DEPTH = 8;
+
+// =====================================================================
+// Traffic Sources
+// =====================================================================
+
+// Read requests from CPU (DFlit type, kind field is irrelevant)
+chan req_src := Source(DFlit)[cpu_req];
+
+// WB data from CPU (filter to wb_k only)
+chan wb_all := Source(DFlit);
+chan wb_only, wb_discard := Switch(wb_all, IsWB, otherwise);
+Sink(wb_discard);
+
+// =====================================================================
+// L3 Instance (Separated DATA FIFOs)
+// =====================================================================
+chan child_req := SuncheekL3Separated(
+    IRSR_DEPTH, WBQ_DEPTH, RX_WR_DEPTH, RX_RESP_DEPTH,
+    req_src, wb_only, ddr_resp
+)[l3_00];
+
+// =====================================================================
+// DDR Turnaround (Local)
+// =====================================================================
+// Child request → DDR processing → DDR response
+chan ddr_proc := Queue(1, child_req);
+
+// Convert child token to resp_k DFlit for DDR response
+chan resp_gen := Source(DFlit);
+chan resp_discard, resp_only := Switch(resp_gen, IsWB, otherwise);
+Sink(resp_discard);
+chan ddr_resp := CtrlJoin(resp_only, ddr_proc)[ddr_turnaround];

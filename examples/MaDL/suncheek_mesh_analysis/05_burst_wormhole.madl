@@ -1,0 +1,154 @@
+// ==========================================================================
+// 05: DMA Burst Wormhole Deadlock — 2x2 Mesh Cross-Traffic
+// ==========================================================================
+//
+// Spec source: Router §1.0 Line 61-67, §2.1.4, §2.3
+//
+// Scenario (2x2 mesh, two DMA agents at opposite corners):
+//
+//   Topology:
+//     [R_NW]---[R_NE]     DMA_A at R_NW (northwest)
+//       |         |       DMA_B at R_SE (southeast)
+//     [R_SW]---[R_SE]
+//
+//   DMA_A sends burst eastward  (NW → NE), passes through R_NW east port
+//   DMA_B sends burst westward  (SE → SW), passes through R_SE west port
+//   Both also need to traverse the central link (R_NW↔R_NE or R_SW↔R_SE)
+//
+//   Non-Interleaving Output Lock (burst_lock):
+//     When a DMA burst is in progress, the output port locks to that
+//     input port. No other VoQ can use the output until burst completes.
+//
+//   Deadlock chain:
+//     [1] DMA_A burst head flit wins SA at R_NW east → output port LOCKED
+//     [2] Shared VoQ at R_NW east blocked → L3 eviction WriteNoSnp stuck
+//     [3] DMA_B burst head flit wins SA at R_SE west → output port LOCKED
+//     [4] Shared VoQ at R_SE west blocked → L3 eviction stuck
+//     [5] L3_NE cannot evict → IRSR saturated → cannot consume DMA_A data
+//     [6] R_NW east credit depleted → DMA_A burst stalled
+//     [7] DMA_A burst not done → R_NW east lock persists → step [2] cycle
+//     [8] Symmetric: DMA_B also stalled → mutual deadlock
+//
+// Model key:
+//   CtrlJoin simulates burst lock: Shared VoQ output must wait for
+//   burst completion signal. Burst completion requires credits.
+//   Credits require downstream consumption. Downstream needs Shared VoQ.
+//   → Circular wait!
+//
+// Parameters:
+//   Dedicated VoQ depth = 2 flit (§2.2)
+//   Shared VoQ depth    = 2 flit (§2.2)
+//   IRSR depth          = 2 (simplified)
+//
+// Expected result: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int DVQO_DEPTH = 2;     // Dedicated VoQ depth (flit)
+param int SVQO_DEPTH = 2;     // Shared VoQ depth (flit)
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// Router R_NW — Eastbound output port
+//
+// DMA_A burst flows east (Dedicated VoQ)
+// L3 eviction WriteNoSnp flows east (Shared VoQ)
+// =====================================================================
+
+chan dma_a_burst := Source(tok);     // DMA_A burst flits (east direction)
+chan l3_evict_e  := Source(tok);     // L3_NW eviction → east to DDR/L3_NE
+
+// --- Dedicated VoQ (DMA burst) ---
+chan ded_voq_e := Queue(DVQO_DEPTH, dma_a_gated);
+
+chan ded_voq_e_out, ded_consumed_e := Fork(ded_voq_e);
+chan ded_credit_e := CreditCounter(5, ded_consumed_e);
+chan dma_a_gated  := CtrlJoin(dma_a_burst, ded_credit_e);
+
+// --- Shared VoQ (L3 eviction) ---
+chan shared_voq_e := Queue(SVQO_DEPTH, l3_evict_e_gated);
+
+chan shared_voq_e_out, shared_consumed_e := Fork(shared_voq_e);
+chan shared_credit_e := CreditCounter(5, shared_consumed_e);
+chan l3_evict_e_gated := CtrlJoin(l3_evict_e, shared_credit_e);
+
+// --- Burst Lock: Shared VoQ blocked until burst flit dequeues ---
+// §1.0: "the output port locks to that input port"
+// Shared VoQ output must wait for burst completion token
+chan burst_done_e, ded_to_l3_e := Fork(ded_voq_e_out);
+chan shared_unlocked_e := CtrlJoin(shared_voq_e_out, burst_done_e);
+
+// =====================================================================
+// Router R_SE — Westbound output port (symmetric)
+//
+// DMA_B burst flows west (Dedicated VoQ)
+// L3 eviction WriteNoSnp flows west (Shared VoQ)
+// =====================================================================
+
+chan dma_b_burst := Source(tok);     // DMA_B burst flits (west direction)
+chan l3_evict_w  := Source(tok);     // L3_SE eviction → west to DDR/L3_SW
+
+// --- Dedicated VoQ (DMA burst) ---
+chan ded_voq_w := Queue(DVQO_DEPTH, dma_b_gated);
+
+chan ded_voq_w_out, ded_consumed_w := Fork(ded_voq_w);
+chan ded_credit_w := CreditCounter(5, ded_consumed_w);
+chan dma_b_gated  := CtrlJoin(dma_b_burst, ded_credit_w);
+
+// --- Shared VoQ (L3 eviction) ---
+chan shared_voq_w := Queue(SVQO_DEPTH, l3_evict_w_gated);
+
+chan shared_voq_w_out, shared_consumed_w := Fork(shared_voq_w);
+chan shared_credit_w := CreditCounter(5, shared_consumed_w);
+chan l3_evict_w_gated := CtrlJoin(l3_evict_w, shared_credit_w);
+
+// --- Burst Lock: Shared VoQ blocked until burst flit dequeues ---
+chan burst_done_w, ded_to_l3_w := Fork(ded_voq_w_out);
+chan shared_unlocked_w := CtrlJoin(shared_voq_w_out, burst_done_w);
+
+// =====================================================================
+// L3_NE (Northeast) — Receives DMA_A data + needs east eviction path
+//
+// DMA_A data arrives from R_NW east port.
+// L3_NE processes it, but may need to evict (WriteNoSnp) via Shared VoQ
+// back through the westbound path — which is burst-locked by DMA_B!
+// =====================================================================
+
+chan l3_ne_rx := Queue(IRSR_DEPTH, Merge(ded_to_l3_e, evict_result_ne));
+
+chan ne_processed, ne_need_evict := LoadBalancer(l3_ne_rx);
+Sink(ne_processed);
+
+// Eviction must go through westbound Shared VoQ (but it's burst-locked!)
+chan ne_evict_tok, ne_wait_tok := Fork(ne_need_evict);
+Sink(ne_wait_tok);
+
+// Eviction completed via the westbound shared path
+chan evict_result_ne := CtrlJoin(shared_unlocked_w, ne_evict_tok);
+
+// =====================================================================
+// L3_SW (Southwest) — Receives DMA_B data + needs west eviction path
+//
+// DMA_B data arrives from R_SE west port.
+// L3_SW processes it, but may need to evict via Shared VoQ
+// through the eastbound path — which is burst-locked by DMA_A!
+// =====================================================================
+
+chan l3_sw_rx := Queue(IRSR_DEPTH, Merge(ded_to_l3_w, evict_result_sw));
+
+chan sw_processed, sw_need_evict := LoadBalancer(l3_sw_rx);
+Sink(sw_processed);
+
+// Eviction must go through eastbound Shared VoQ (but it's burst-locked!)
+chan sw_evict_tok, sw_wait_tok := Fork(sw_need_evict);
+Sink(sw_wait_tok);
+
+// Eviction completed via the eastbound shared path
+chan evict_result_sw := CtrlJoin(shared_unlocked_e, sw_evict_tok);

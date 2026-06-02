@@ -1,0 +1,154 @@
+// ==========================================================================
+// F04: Flit-Level Data Channel RX FIFO Deadlock — 2-Node Shared FIFO
+// ==========================================================================
+//
+// Flit-level version of 04a_data_rx_shared.madl
+//
+// Spec key parameters (flit level):
+//   Data Channel flit width = 256-bit (§5.2)
+//   Cacheline = 64B = 2 flit  (data_id=0 + data_id=1)
+//   RX FIFO = 8 flit = 4 cacheline packets (§8.1)
+//   WBQ = 4 flit = 2 WB packets
+//
+// Critical difference from packet level:
+//   Packet level: Queue(8) = 8 full transactions → generous capacity
+//   Flit   level: Queue(8) = 8 flit = 4 transactions → capacity halved!
+//
+// Scenario (2 nodes, A and B):
+//   Each node has:
+//     - 2 WB flit sources (1 WriteBack_Custom packet = 2 flits)
+//     - 2 CompData flit sources (1 CompData packet = 2 flits)
+//     - 1 shared RX FIFO(8 flit) with credit-based flow control
+//     - WBQ(4 flit) for write processing
+//     - IRSR(2) for transaction tracking
+//     - CtrlJoin for miss-wait dependency on CompData
+//
+//   Deadlock chain per node:
+//     [1] 4 WB flits (2 sources × 2 flit) fill half the 8-flit FIFO
+//     [2] Continuous WB traffic saturates remaining FIFO capacity
+//     [3] CompData flits cannot enter FIFO → blocked
+//     [4] WBQ full → FIFO cannot drain WB → FIFO stays full
+//     [5] IRSR miss waits for CompData → CompData blocked → cycle
+//
+//   Cross-node amplification:
+//     Both nodes exhibit the same pattern simultaneously
+//
+// Expected result: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int FIFO_DEPTH_FLIT = 8;     // §8.1: 8 flit
+param int WBQ_DEPTH_FLIT = 4;      // 4 flit = 2 WB packets
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// Node A — Traffic sources: each cacheline = 2 flits
+// =====================================================================
+chan wb_flit0_a  := Source(tok);     // WriteBack flit 0 (data_id=0)
+chan wb_flit1_a  := Source(tok);     // WriteBack flit 1 (data_id=1)
+chan resp_flit0_a := Source(tok);    // CompData flit 0
+chan resp_flit1_a := Source(tok);    // CompData flit 1
+
+// =====================================================================
+// Node A — Shared RX FIFO (8 flit depth)
+//
+// 4 flit sources share same FIFO + same credit pool
+// WB's 4 flits (2 packets × 2 flit) occupy half the FIFO!
+// =====================================================================
+chan fifo_in_a := Merge(Merge(wb_f0_gated_a, wb_f1_gated_a),
+                        Merge(resp_f0_gated_a, resp_f1_gated_a));
+
+chan fifo_out_a, fifo_consumed_a := Fork(Queue(FIFO_DEPTH_FLIT, fifo_in_a));
+chan fifo_credit_a := CreditCounter(FIFO_DEPTH_FLIT, fifo_consumed_a);
+
+// 4-way credit distribution via Fork chain
+chan cr0_a, cr_rest_a := Fork(fifo_credit_a);
+chan cr1_a, cr_rest2_a := Fork(cr_rest_a);
+chan cr2_a, cr3_a := Fork(cr_rest2_a);
+
+chan wb_f0_gated_a   := CtrlJoin(wb_flit0_a, cr0_a);
+chan wb_f1_gated_a   := CtrlJoin(wb_flit1_a, cr1_a);
+chan resp_f0_gated_a := CtrlJoin(resp_flit0_a, cr2_a);
+chan resp_f1_gated_a := CtrlJoin(resp_flit1_a, cr3_a);
+
+// =====================================================================
+// Node A — L3 internal processing
+// =====================================================================
+chan wb_path_a, resp_path_a := LoadBalancer(fifo_out_a);
+
+// WBQ: process WriteBack flits
+chan wbq_a := Queue(WBQ_DEPTH_FLIT, wb_path_a);
+chan wb_done_a, wb_trigger_a := Fork(wbq_a);
+Sink(wb_done_a);
+
+// IRSR: read request tracking
+chan irsr_a := Queue(IRSR_DEPTH, wb_trigger_a);
+chan hit_a, miss_a := LoadBalancer(irsr_a);
+Sink(hit_a);
+
+// Miss → child request (ReadNoSnp to DDR)
+chan child_tok_a, wait_tok_a := Fork(miss_a);
+Sink(child_tok_a);
+
+// Wait for DDR CompData to return — miss-wait dependency
+chan wait_q_a := Queue(IRSR_DEPTH, wait_tok_a);
+chan done_a := CtrlJoin(wait_q_a, resp_path_a);
+Sink(done_a);
+
+// =====================================================================
+// Node B — Traffic sources: each cacheline = 2 flits
+// =====================================================================
+chan wb_flit0_b  := Source(tok);     // WriteBack flit 0 (data_id=0)
+chan wb_flit1_b  := Source(tok);     // WriteBack flit 1 (data_id=1)
+chan resp_flit0_b := Source(tok);    // CompData flit 0
+chan resp_flit1_b := Source(tok);    // CompData flit 1
+
+// =====================================================================
+// Node B — Shared RX FIFO (8 flit depth)
+// =====================================================================
+chan fifo_in_b := Merge(Merge(wb_f0_gated_b, wb_f1_gated_b),
+                        Merge(resp_f0_gated_b, resp_f1_gated_b));
+
+chan fifo_out_b, fifo_consumed_b := Fork(Queue(FIFO_DEPTH_FLIT, fifo_in_b));
+chan fifo_credit_b := CreditCounter(FIFO_DEPTH_FLIT, fifo_consumed_b);
+
+// 4-way credit distribution via Fork chain
+chan cr0_b, cr_rest_b := Fork(fifo_credit_b);
+chan cr1_b, cr_rest2_b := Fork(cr_rest_b);
+chan cr2_b, cr3_b := Fork(cr_rest2_b);
+
+chan wb_f0_gated_b   := CtrlJoin(wb_flit0_b, cr0_b);
+chan wb_f1_gated_b   := CtrlJoin(wb_flit1_b, cr1_b);
+chan resp_f0_gated_b := CtrlJoin(resp_flit0_b, cr2_b);
+chan resp_f1_gated_b := CtrlJoin(resp_flit1_b, cr3_b);
+
+// =====================================================================
+// Node B — L3 internal processing
+// =====================================================================
+chan wb_path_b, resp_path_b := LoadBalancer(fifo_out_b);
+
+// WBQ: process WriteBack flits
+chan wbq_b := Queue(WBQ_DEPTH_FLIT, wb_path_b);
+chan wb_done_b, wb_trigger_b := Fork(wbq_b);
+Sink(wb_done_b);
+
+// IRSR: read request tracking
+chan irsr_b := Queue(IRSR_DEPTH, wb_trigger_b);
+chan hit_b, miss_b := LoadBalancer(irsr_b);
+Sink(hit_b);
+
+// Miss → child request
+chan child_tok_b, wait_tok_b := Fork(miss_b);
+Sink(child_tok_b);
+
+// Wait for DDR CompData — miss-wait dependency
+chan wait_q_b := Queue(IRSR_DEPTH, wait_tok_b);
+chan done_b := CtrlJoin(wait_q_b, resp_path_b);
+Sink(done_b);

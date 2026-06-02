@@ -1,0 +1,83 @@
+// Suncheek Mesh Analysis - Model 03b: Parent-Child Separated VoQ
+//
+// Same architecture as 03a, but child requests (ReadNoSnp from L3)
+// use a SEPARATE dedicated queue to reach DDR, independent of parent traffic.
+// This models the Suncheek Shared VoQ solution that breaks the deadlock:
+//   - Parent requests (CPU → L3): parentFabric queue
+//   - Child requests (L3 → DDR): childFabric queue (separate!)
+//   - DDR responses (DDR → L3): separate response path
+//
+// Expected: NO DEADLOCK
+
+param int QSIZE = 2;
+param int IRSR_DEPTH = 2;
+param int DDR_Q = 2;
+
+const tok;
+const pkt;
+
+uses lib.suncheek_l3;
+
+// =====================================================================
+// CPU Sources (4 clusters in a 2x2 mesh)
+// =====================================================================
+chan cpu00_req := Source(pkt)[cpu00];
+chan cpu10_req := Source(pkt)[cpu10];
+chan cpu01_req := Source(pkt)[cpu01];
+chan cpu11_req := Source(pkt)[cpu11];
+
+// =====================================================================
+// L3 Instances
+// Forward-referenced channels are resolved by MADL automatically.
+// =====================================================================
+chan l3_00_resp, l3_00_child := SuncheekL3(IRSR_DEPTH, node00_l3_in, node00_ddr_rsp)[l3_00];
+chan l3_10_resp, l3_10_child := SuncheekL3(IRSR_DEPTH, node10_l3_in, node10_ddr_rsp)[l3_10];
+chan l3_01_resp, l3_01_child := SuncheekL3(IRSR_DEPTH, node01_l3_in, node01_ddr_rsp)[l3_01];
+chan l3_11_resp, l3_11_child := SuncheekL3(IRSR_DEPTH, node11_l3_in, node11_ddr_rsp)[l3_11];
+
+// =====================================================================
+// PARENT REQUEST FABRIC (CPU -> L3)
+// Parent requests go through their own dedicated channel.
+// This fabric CANNOT be blocked by child requests.
+// =====================================================================
+chan parent_all := Merge(cpu00_req, Merge(cpu10_req, Merge(cpu01_req, cpu11_req)))[mrgParent];
+chan parent_fabric := Queue(QSIZE, parent_all)[parentFabric];
+
+// Route to L3 instances
+chan to_node0x, to_node1x := LoadBalancer(parent_fabric)[lb_row];
+chan node00_l3_in, node10_l3_in := LoadBalancer(to_node0x)[lb_col0];
+chan node01_l3_in, node11_l3_in := LoadBalancer(to_node1x)[lb_col1];
+
+// =====================================================================
+// CHILD REQUEST FABRIC (L3 -> DDR) — SEPARATE from parent!
+// This is the key difference from 03a: child requests have their
+// own buffer pool and cannot be starved by parent traffic.
+// =====================================================================
+chan child_all := Merge(l3_00_child, Merge(l3_10_child, Merge(l3_01_child, l3_11_child)))[mrgChild];
+chan child_fabric := Queue(QSIZE, child_all)[childFabric];
+
+// DDR consumes child requests
+Sink(child_fabric)[ddr_req_sink];
+
+// =====================================================================
+// DDR RESPONSE FABRIC (DDR -> L3) — Also separate
+// DDR responses flow through their own independent path back to L3.
+// =====================================================================
+chan ddr_rsp := Source(pkt)[ddr_rsp_src];
+
+chan ddr_to_00, ddr_to_rest := LoadBalancer(ddr_rsp)[lb_ddr_rsp0];
+chan ddr_to_10, ddr_to_rest2 := LoadBalancer(ddr_to_rest)[lb_ddr_rsp1];
+chan ddr_to_01, ddr_to_11 := LoadBalancer(ddr_to_rest2)[lb_ddr_rsp2];
+
+chan node00_ddr_rsp := Queue(DDR_Q, ddr_to_00)[ddrRsp00];
+chan node10_ddr_rsp := Queue(DDR_Q, ddr_to_10)[ddrRsp10];
+chan node01_ddr_rsp := Queue(DDR_Q, ddr_to_01)[ddrRsp01];
+chan node11_ddr_rsp := Queue(DDR_Q, ddr_to_11)[ddrRsp11];
+
+// =====================================================================
+// Consume L3 responses (CPU receives data)
+// =====================================================================
+Sink(l3_00_resp)[sink_data00];
+Sink(l3_10_resp)[sink_data10];
+Sink(l3_01_resp)[sink_data01];
+Sink(l3_11_resp)[sink_data11];

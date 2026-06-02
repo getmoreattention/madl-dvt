@@ -1,0 +1,120 @@
+// ==========================================================================
+// M01: Single Suncheek Node — Router + L3 Internal Interactions
+// ==========================================================================
+//
+// Layer 1 of incremental mesh deadlock analysis.
+//
+// Model:
+//   A single node with external traffic sources representing
+//   incoming REQ, DATA (split WB/Resp), RSP, SNP channels.
+//
+//   L3 Pipeline:
+//     REQ Source → RX FIFO(8) → IRSR(4) → Hit/Miss decision
+//     Hit  → Sink (CompData response, simplified)
+//     Miss → Fork → one arm waits, other generates child request
+//            Child → Queue(1) simulating DDR turnaround
+//            DDR returns → CtrlJoin(miss_wait, ddr_resp) → Sink
+//
+//   Data Channel:
+//     LoadBalancer splits rx_data into WB and RespData paths
+//     WB       → WBQ(4) → Sink
+//     RespData → feeds miss completion via CtrlJoin
+//
+//   SNP/RSP: Queue → Sink (simplified processing)
+//
+// Parameters:
+//   RX FIFO depth = 8   (L3 Architecture §8.1)
+//   IRSR depth    = 4   (L3 Spec §2.3)
+//   WBQ depth     = 4   (L3 Spec §2.5)
+//   DDR latency   = 1   (Queue depth simulating round-trip)
+//
+// Expected: NO DEADLOCK (single node, no routing contention)
+// ==========================================================================
+
+const tok;
+
+param int RX_FIFO_DEPTH = 8;   // L3 Architecture §8.1
+param int IRSR_DEPTH    = 4;   // L3 Spec §2.3
+param int WBQ_DEPTH     = 4;   // L3 Spec §2.5
+param int DDR_LATENCY   = 1;   // Simplified DDR turnaround
+param int SNP_DEPTH     = 4;   // SNP processing queue
+param int RSP_DEPTH     = 6;   // RSP FIFO depth (L3 Architecture §8.1)
+
+// =====================================================================
+// CreditCounter macro (standard library pattern)
+// =====================================================================
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// Traffic Sources — External inputs to this node
+// =====================================================================
+chan ext_req  := Source(tok);    // Incoming REQ channel (ReadNoSnp, etc.)
+chan ext_data := Source(tok);    // Incoming DATA channel (WB + CompData mixed)
+chan ext_snp  := Source(tok);    // Incoming SNP channel (snoops)
+chan ext_rsp  := Source(tok);    // Incoming RSP channel (responses)
+
+// =====================================================================
+// REQ Channel → L3 Pipeline
+// =====================================================================
+
+// RX FIFO for REQ channel
+chan req_fifo := Queue(RX_FIFO_DEPTH, ext_req);
+
+// IRSR: tracks in-flight requests (acts as backpressure point)
+chan irsr := Queue(IRSR_DEPTH, req_fifo);
+
+// Hit/Miss decision (non-deterministic, modeling L3 NINE policy)
+chan hit, miss := LoadBalancer(irsr);
+
+// Hit path: L3 has data, generate CompData response → Sink
+Sink(hit);
+
+// Miss path: need to fetch from DDR
+chan child_tok, wait_tok := Fork(miss);
+
+// Child request: L3 generates ReadNoSnp to DDR
+chan child_src := Source(tok);
+chan child_req := CtrlJoin(child_src, child_tok);
+
+// DDR turnaround: child request → DDR → response comes back
+chan ddr_turnaround := Queue(DDR_LATENCY, child_req);
+
+// Miss completion: wait for DDR response to come back
+chan wait_q := Queue(IRSR_DEPTH, wait_tok);
+chan miss_done := CtrlJoin(wait_q, ddr_turnaround);
+Sink(miss_done);
+
+// =====================================================================
+// DATA Channel — WB and RespData split
+// =====================================================================
+
+// RX FIFO for DATA channel (shared between WB and RespData)
+chan data_fifo := Queue(RX_FIFO_DEPTH, ext_data);
+
+// LoadBalancer splits: simulates opcode decode (is_sn bit)
+// WB = WriteBack_Custom (RN→HN), RespData = CompData (SN→HN)
+chan wb_path, resp_path := LoadBalancer(data_fifo);
+
+// WBQ: buffers WriteBack data before L3 write
+chan wbq := Queue(WBQ_DEPTH, wb_path);
+Sink(wbq);
+
+// RespData path: feeds back into L3 (simplified — just Sink here)
+// In the full model, this would feed into IRSR completion
+Sink(resp_path);
+
+// =====================================================================
+// SNP Channel — Snoop Processing
+// =====================================================================
+chan snp_fifo := Queue(SNP_DEPTH, ext_snp);
+Sink(snp_fifo);
+
+// =====================================================================
+// RSP Channel — Response Processing
+// =====================================================================
+chan rsp_fifo := Queue(RSP_DEPTH, ext_rsp);
+Sink(rsp_fifo);

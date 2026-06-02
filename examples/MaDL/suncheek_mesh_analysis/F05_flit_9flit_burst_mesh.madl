@@ -1,0 +1,98 @@
+// ==========================================================================
+// F05: 4-Flit DMA Burst Through 2-Node Mesh — Burst Lock Deadlock
+// ==========================================================================
+//
+// Spec source:
+//   §5.2: DMA packet = Header(1 flit) + Data(N flit)
+//   §2.1.1: VoQ = 2 flit
+//   §2.1.3: Credit = 5
+//   §1.0: Burst locking (non-interleaving output lock)
+//
+// Scenario:
+//   DMA agent sends 4-flit burst (header + 3 data flits)
+//   Dedicated VoQ(2) carries burst flits with credit(5)
+//   Shared VoQ(2) carries L3 eviction (2 flit per eviction)
+//   Burst lock: CtrlJoin(shared_voq_out, burst_done_tok)
+//
+//   4 flits > VoQ(2): burst must pipeline through VoQ in 2 rounds
+//   L3 processing creates eviction need → eviction needs Shared VoQ
+//   → blocked by burst_lock → L3 cannot consume → credits don't return
+//   → burst stalls → cycle!
+//
+// Note: Production max = 9 flit. 4 flit used for SMT tractability.
+//       The deadlock mechanism is identical — burst_lock blocks Shared
+//       VoQ regardless of burst length.
+//
+// Expected result: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int VOQ_FLIT = 2;
+param int CREDIT_FLIT = 5;
+param int IRSR_DEPTH = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// DMA Burst: 4 flit (header + 3 data)
+// =====================================================================
+chan dma_f0 := Source(tok);
+chan dma_f1 := Source(tok);
+chan dma_f2 := Source(tok);
+chan dma_f3 := Source(tok);
+
+// L3 eviction: 2 flit per eviction packet
+chan evict_f0 := Source(tok);
+chan evict_f1 := Source(tok);
+
+// =====================================================================
+// Dedicated VoQ (2 flit): DMA burst flits share credit pool
+// =====================================================================
+chan ded_in := Merge(Merge(dma_f0_g, dma_f1_g), Merge(dma_f2_g, dma_f3_g));
+
+chan ded_voq := Queue(VOQ_FLIT, ded_in);
+chan ded_out, ded_consumed := Fork(ded_voq);
+chan ded_credit := CreditCounter(CREDIT_FLIT, ded_consumed);
+
+chan cd0, cd_r1 := Fork(ded_credit);
+chan cd1, cd_r2 := Fork(cd_r1);
+chan cd2, cd3 := Fork(cd_r2);
+
+chan dma_f0_g := CtrlJoin(dma_f0, cd0);
+chan dma_f1_g := CtrlJoin(dma_f1, cd1);
+chan dma_f2_g := CtrlJoin(dma_f2, cd2);
+chan dma_f3_g := CtrlJoin(dma_f3, cd3);
+
+// =====================================================================
+// Shared VoQ (2 flit): L3 eviction traffic
+// =====================================================================
+chan shared_in := Merge(evict_f0_g, evict_f1_g);
+chan shared_voq := Queue(VOQ_FLIT, shared_in);
+chan shared_out, shared_consumed := Fork(shared_voq);
+chan shared_credit := CreditCounter(CREDIT_FLIT, shared_consumed);
+chan ce0, ce1 := Fork(shared_credit);
+
+chan evict_f0_g := CtrlJoin(evict_f0, ce0);
+chan evict_f1_g := CtrlJoin(evict_f1, ce1);
+
+// =====================================================================
+// Burst Lock: Shared VoQ gated by DMA burst completion
+// =====================================================================
+chan burst_done, ded_to_l3 := Fork(ded_out);
+chan shared_unlocked := CtrlJoin(shared_out, burst_done);
+
+// =====================================================================
+// L3 processing: DMA data → may need eviction → deadlock
+// =====================================================================
+chan l3_rx := Queue(IRSR_DEPTH, Merge(ded_to_l3, evict_result));
+chan processed, need_evict := LoadBalancer(l3_rx);
+Sink(processed);
+
+chan evict_tok, wait_tok := Fork(need_evict);
+Sink(wait_tok);
+chan evict_result := CtrlJoin(shared_unlocked, evict_tok);

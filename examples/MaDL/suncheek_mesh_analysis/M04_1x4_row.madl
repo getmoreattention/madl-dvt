@@ -1,0 +1,271 @@
+// ==========================================================================
+// M04: 4×2 Mesh — Multi-hop Routing + L3 Backpressure
+// ==========================================================================
+//
+// Layer 4: 8 nodes in a 4×2 mesh — tests multi-hop credit chains.
+// Uses exact same structure as mesh_xy.madl but with L3 processing.
+//
+// Key test: Node(0,0)→Node(3,1) = 4 hops.
+// With VoQ(2), can multi-hop traffic coexist without deadlock?
+//
+// Expected: Need to verify with L3 backpressure
+// ==========================================================================
+
+param int QSIZE = 2;
+param int XDIM = 4;
+param int YDIM = 2;
+param int XBITS = 2;
+param int YBITS = 0;
+param int CSIZE = 2;
+param int WITH_LOCAL_QUEUE = 1;
+param int IRSR_DEPTH = 4;
+
+struct Pkt {
+  destx : [XBITS:0];
+  desty : [YBITS:0];
+};
+
+const tok;
+
+// Macros from mesh_xy/lib/main.madl
+macro FilterXY2 (int xID, int yID, chan input) => chan o {
+    pred BadPackets (p: Pkt) {
+    	 (p.destx == xID && p.desty == yID) || p.destx >= XDIM || p.desty >= YDIM
+    };
+    chan toSink;
+    let toSink,o := Switch(input,BadPackets,otherwise);
+    Sink(toSink);
+};
+
+macro deadSource () => chan o {
+  enum empty {};
+  let o := Source(empty);
+};
+
+macro Merge5 (bus<5> inPorts) => chan o {
+    let o:= Merge(inPorts[4],Merge(inPorts[3], Merge(inPorts[2], Merge(inPorts[0],inPorts[1]))));
+};
+
+macro XYRoutingLogic (int xID, int yID, chan inPort) => bus<5> outPorts {
+   chan eqx,notEqx;
+   let eqx, notEqx := Switch(inPort,Pkt.destx == xID,otherwise);
+   chan notEqy;
+   let outPorts[0],notEqy := Switch(eqx,Pkt.desty == yID, otherwise); 
+   let outPorts[1],outPorts[2] := Switch(notEqx,Pkt.destx < xID,otherwise);
+   let outPorts[4],outPorts[3] := Switch (notEqy, Pkt.desty < yID,otherwise);
+};
+
+// XYRouter5P — exact copy from mesh_xy/lib/paramrouter.madl
+macro XYRouter5P (int xID, int yID, bus<5> ins) => bus<5> outs{
+    bus<5> routedInLocal;
+    if (WITH_LOCAL_QUEUE == 0) {
+       let routedInLocal  := XYRoutingLogic(xID,yID,ins[0]); 
+    }
+    else {
+        let routedInLocal  :=XYRoutingLogic(xID,yID,Queue(QSIZE,ins[0])[local_Q]);
+    };
+
+   if (xID == 0) {
+     Sink(ins[1]);
+   }
+   else {
+      bus<5> routedInWest;
+      let routedInWest   := XYRoutingLogic(xID,yID,Queue(QSIZE,ins[1])[westQ]);
+   };
+
+   if (xID == XDIM-1) {
+      Sink(ins[2]);
+   }
+   else {
+      bus<5> routedInEast;
+      let routedInEast   := XYRoutingLogic(xID,yID,Queue(QSIZE,ins[2])[eastQ]);
+   };
+
+   if (yID == YDIM-1) {
+      Sink(ins[3]);
+   }
+   else {
+      bus<5> routedInNorth;
+      let routedInNorth  := XYRoutingLogic(xID,yID,Queue(QSIZE,ins[3])[northQ]);
+   };
+
+   if (yID == 0) {
+      Sink(ins[4]);
+   }
+   else {
+      bus<5> routedInSouth;
+      let routedInSouth  := XYRoutingLogic(xID,yID,Queue(QSIZE,ins[4]));
+   };
+   
+   for (int i = 0;i<5;i++) {
+     if (yID == 0) {
+        if (xID == 0) {
+	   let outs[i] := Merge(routedInLocal[i],Merge(routedInEast[i],routedInNorth[i]));
+	}
+	else {
+	   if (xID == XDIM - 1) {
+	      let outs[i] := Merge(routedInLocal[i],Merge(routedInWest[i],routedInNorth[i]));
+	   }
+	   else {
+              let outs[i] := Merge(routedInLocal[i],Merge(routedInWest[i],Merge(routedInEast[i],routedInNorth[i])));
+	   };
+	};
+     }
+     else {
+        if (yID == YDIM - 1) {
+	 if (xID == 0) {
+	    let outs[i] := Merge(routedInLocal[i],Merge(routedInEast[i],routedInSouth[i]));
+	 }
+	 else {
+	    if (xID == XDIM - 1) {
+	       let outs[i] := Merge(routedInLocal[i],Merge(routedInWest[i],routedInSouth[i]));
+	    }
+	    else { 
+	       let outs[i] := Merge(routedInLocal[i],Merge(routedInWest[i],Merge(routedInEast[i],routedInSouth[i])));
+	    };
+	 };
+	}
+	else {
+	 if (xID == 0) {
+	    let outs[i] := Merge(routedInLocal[i],Merge(routedInEast[i],Merge(routedInNorth[i],routedInSouth[i])));
+	 }
+	 else {
+	    if (xID == XDIM - 1) {
+	       let outs[i] := Merge(routedInLocal[i],Merge(routedInWest[i],Merge(routedInNorth[i],routedInSouth[i])));
+	    }
+	    else {
+               let outs[i] := Merge5(routedInLocal[i],routedInWest[i],routedInEast[i],routedInNorth[i],routedInSouth[i]);
+	    };
+	 };
+	};
+     };
+   };
+};
+
+// Generate the Local Sources
+bus<XDIM*YDIM> srcs;
+for (int y = 0; y<YDIM;y++) {
+    for (int x = 0; x < XDIM; x++) {
+    	let srcs[x+y*XDIM] := FilterXY2(x,y,Source(Pkt));
+    };
+};
+
+// Generate All Routers
+bus<5*XDIM*YDIM> allOUTS;
+for (int y = 0; y < YDIM; y++) {
+    for (int x = 0; x < XDIM ; x++) {
+       if (y == 0) {
+         if (x == 0) {
+	    let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+	    XYRouter5P(x,y,srcs[x+y*XDIM],deadSource(), allOUTS[y*XDIM*5+(x+1)*5+1],allOUTS[(y+1)*XDIM*5+x*5+4],deadSource());
+	 }
+	 else {
+	      if (x == XDIM - 1) {
+	      let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+              XYRouter5P(x,y,srcs[x+y*XDIM],allOUTS[y*XDIM*5+(x-1)*5+2],deadSource(),allOUTS[(y+1)*XDIM*5+x*5+4],deadSource());
+	    }
+	    else {
+	      let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+              XYRouter5P(x,y,srcs[x+y*XDIM],allOUTS[y*XDIM*5+(x-1)*5+2],allOUTS[y*XDIM*5+(x+1)*5+1],allOUTS[(y+1)*XDIM*5+x*5+4],deadSource());
+	    };
+	 };
+       }
+       else {
+          if (y == YDIM - 1) {
+	     if (x == 0) {
+	        let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+                XYRouter5P(x,y,srcs[x+y*XDIM],deadSource(),allOUTS[y*XDIM*5+(x+1)*5+1],deadSource(),allOUTS[(y-1)*XDIM*5+x*5+3]);
+	     }
+	     else {
+	        if (x == XDIM - 1) {
+		   let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+                   XYRouter5P(x,y,srcs[x+y*XDIM],allOUTS[y*XDIM*5+(x-1)*5+2],deadSource(),deadSource(),allOUTS[(y-1)*XDIM*5+x*5+3]);
+		}
+		else {
+		   let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+                   XYRouter5P(x,y,srcs[x+y*XDIM],allOUTS[y*XDIM*5+(x-1)*5+2],allOUTS[y*XDIM*5+(x+1)*5+1],deadSource(),allOUTS[(y-1)*XDIM*5+x*5+3]);
+		};
+	     };
+	  }
+	  else {
+	     if (x == 0) {
+	      let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+              XYRouter5P(x,y,srcs[x+y*XDIM],deadSource(),allOUTS[y*XDIM*5+(x+1)*5+1],allOUTS[(y+1)*XDIM*5+x*5+4],allOUTS[(y-1)*XDIM*5+x*5+3]);	      
+	     }
+	     else {
+	        if (x == XDIM - 1) {
+		   let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+                   XYRouter5P(x,y,srcs[x+y*XDIM],allOUTS[y*XDIM*5+(x-1)*5+2],deadSource(),allOUTS[(y+1)*XDIM*5+x*5+4],allOUTS[(y-1)*XDIM*5+x*5+3]);	      
+		}
+		else {
+		   let allOUTS[y*XDIM*5+x*5],allOUTS[y*XDIM*5+x*5+1],allOUTS[y*XDIM*5+x*5+2],allOUTS[y*XDIM*5+x*5+3],allOUTS[y*XDIM*5+x*5+4] :=
+                   XYRouter5P(x,y,srcs[x+y*XDIM],allOUTS[y*XDIM*5+(x-1)*5+2],allOUTS[y*XDIM*5+(x+1)*5+1],allOUTS[(y+1)*XDIM*5+x*5+4],allOUTS[(y-1)*XDIM*5+x*5+3]);	      
+		};
+	     };
+	  };
+       };
+    };
+};
+
+// Sink border outputs
+for (int y = 0; y < YDIM ; y++) {
+   for (int x = 0; x < XDIM ; x++){
+       if (y == 0) {
+          if (x == 0) {	
+             DeadSink(allOUTS[y*XDIM*5+x*5+1]);
+	     DeadSink(allOUTS[y*XDIM*5+x*5+4]);
+	  }
+	  else {
+	     if (x == XDIM-1) { 
+	        DeadSink(allOUTS[y*XDIM*5+x*5+2]);
+		DeadSink(allOUTS[y*XDIM*5+x*5+4]);
+	     }
+	     else {
+	        DeadSink(allOUTS[y*XDIM*5+x*5+4]);		
+            };
+	  };
+       }
+       else {
+          if (y == YDIM - 1) {
+	     if (x == 0) {
+	        DeadSink(allOUTS[y*XDIM*5+x*5+1]);
+		DeadSink(allOUTS[y*XDIM*5+x*5+3]);		
+	     }
+	     else {
+	        if (x == XDIM - 1) {
+		   DeadSink(allOUTS[y*XDIM*5+x*5+2]);
+		   DeadSink(allOUTS[y*XDIM*5+x*5+3]);
+		}
+		else {
+		   DeadSink(allOUTS[y*XDIM*5+x*5+3]);
+		};
+	     };
+	  }
+	  else {
+	     if (x == 0) {
+	        DeadSink(allOUTS[y*XDIM*5+x*5+1]);
+	     }
+	     else {
+	        if (x == XDIM - 1) {
+		   DeadSink(allOUTS[y*XDIM*5+x*5+2]);
+		}
+		else {
+		};
+	     };
+	  };       
+       };
+   };
+};
+
+// L3 Processing at Each Local Output
+for (int i = 0; i < XDIM*YDIM; i++) {
+    chan l3_irsr := Queue(IRSR_DEPTH, allOUTS[i*5]);
+    chan l3_hit, l3_miss := LoadBalancer(l3_irsr);
+    Sink(l3_hit);
+    chan miss_wait, child_req := Fork(l3_miss);
+    chan wait_q := Queue(IRSR_DEPTH, miss_wait);
+    chan ddr_proc := Queue(1, child_req);
+    chan ddr_resp := Queue(1, ddr_proc);
+    chan done := CtrlJoin(wait_q, ddr_resp);
+    Sink(done);
+};

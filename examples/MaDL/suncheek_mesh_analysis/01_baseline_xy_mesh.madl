@@ -1,0 +1,61 @@
+// Suncheek Mesh Analysis - Model 01: Baseline XY Mesh
+// 2x2 mesh with standard XY routing
+// Expected: NO DEADLOCK (baseline reference)
+
+param int QSIZE = 2;
+param int XDIM = 2;
+param int YDIM = 2;
+param int XBITS = 0;
+param int YBITS = 0;
+
+struct Pkt {
+    destx : [XBITS:0];
+    desty : [YBITS:0];
+};
+
+const tok;
+
+uses lib.mesh_macros;
+
+// Generate local sources (one per node, filtering self-destined packets)
+bus<XDIM*YDIM> srcs;
+for (int y = 0; y < YDIM; y++) {
+    for (int x = 0; x < XDIM; x++) {
+        let srcs[x+y*XDIM] := FilterXY2(x, y, Source(Pkt));
+    };
+};
+
+// Generate all routers - 2x2 mesh
+// allOUTS[y*XDIM*5 + x*5 + port] where port: 0=local,1=west,2=east,3=north,4=south
+bus<5*XDIM*YDIM> allOUTS;
+
+// Node (0,0) - bottom-left corner: no west, no south neighbors
+let allOUTS[0],allOUTS[1],allOUTS[2],allOUTS[3],allOUTS[4] :=
+    XYRouter5(0, 0, srcs[0], deadSource(), allOUTS[1*5+1], allOUTS[1*XDIM*5+0*5+4], deadSource());
+
+// Node (1,0) - bottom-right corner: no east, no south neighbors  
+let allOUTS[5],allOUTS[6],allOUTS[7],allOUTS[8],allOUTS[9] :=
+    XYRouter5(1, 0, srcs[1], allOUTS[0*5+2], deadSource(), allOUTS[1*XDIM*5+1*5+4], deadSource());
+
+// Node (0,1) - top-left corner: no west, no north neighbors
+let allOUTS[10],allOUTS[11],allOUTS[12],allOUTS[13],allOUTS[14] :=
+    XYRouter5(0, 1, srcs[2], deadSource(), allOUTS[1*XDIM*5+1*5+1], deadSource(), allOUTS[0*XDIM*5+0*5+3]);
+
+// Node (1,1) - top-right corner: no east, no north neighbors
+let allOUTS[15],allOUTS[16],allOUTS[17],allOUTS[18],allOUTS[19] :=
+    XYRouter5(1, 1, srcs[3], allOUTS[1*XDIM*5+0*5+2], deadSource(), deadSource(), allOUTS[0*XDIM*5+1*5+3]);
+
+// Sink border outputs (should never receive data with XY routing)
+DeadSink(allOUTS[1]);   // Node(0,0) west
+DeadSink(allOUTS[4]);   // Node(0,0) south
+DeadSink(allOUTS[7]);   // Node(1,0) east
+DeadSink(allOUTS[9]);   // Node(1,0) south
+DeadSink(allOUTS[11]);  // Node(0,1) west
+DeadSink(allOUTS[13]);  // Node(0,1) north
+DeadSink(allOUTS[17]);  // Node(1,1) east
+DeadSink(allOUTS[18]);  // Node(1,1) north
+
+// Sink all local outputs
+for (int i = 0; i < XDIM*YDIM; i++) {
+    Sink(allOUTS[i*5]);
+};

@@ -1,0 +1,18 @@
+// Suncheek Mesh Analysis - Type Definitions
+// Starting with 2x2 mesh for fast verification, scalable to 4x4
+
+param int XDIM = 2;
+param int YDIM = 2;
+param int XBITS = 0;  // ceil(log2(XDIM))-1, for 2x2: 0
+param int YBITS = 0;
+param int QSIZE = 2;  // VoQ depth (matches Suncheek spec)
+param int IRSR_DEPTH = 2;  // IRSR buffer depth
+param int RX_DEPTH = 2;    // RX FIFO depth
+
+const tok;
+
+// Basic packet with routing fields
+struct Pkt {
+    destx : [XBITS:0];
+    desty : [YBITS:0];
+};

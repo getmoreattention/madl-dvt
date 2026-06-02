@@ -1,0 +1,28 @@
+// Suncheek L3 Cache / Home Node (HN) Protocol Agent
+// Models the Parent-Child transaction pattern for deadlock verification
+//
+// Source blocking = deadlock, PatientSource blocking = normal.
+
+const tok;
+
+macro SuncheekL3 (int irsr_depth, chan req_in, chan ddr_resp_in) => chan cpu_resp, chan child_req {
+    chan irsr_out := Queue(irsr_depth, req_in);
+    chan hit, miss := LoadBalancer(irsr_out);
+
+    // HIT PATH
+    chan hit_src := Source(tok);
+    chan hit_data := CtrlJoin(hit_src, hit);
+
+    // MISS PATH
+    chan child_token, wait_token := Fork(miss);
+
+    chan child_pkt := Source(tok);
+    let child_req := CtrlJoin(child_pkt, child_token);
+
+    chan wait_q := Queue(irsr_depth, wait_token);
+    chan ddr_synced := CtrlJoin(wait_q, ddr_resp_in);
+    chan miss_src := Source(tok);
+    chan miss_data := CtrlJoin(miss_src, ddr_synced);
+
+    let cpu_resp := Merge(hit_data, miss_data);
+};

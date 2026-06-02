@@ -1,0 +1,181 @@
+// ==========================================================================
+// M03: 2×2 Mesh with XY Routing + L3 Backpressure
+// ==========================================================================
+//
+// Layer 3 of incremental mesh deadlock analysis.
+//
+// Builds on mesh_xy_22.madl topology, adding L3 processing at each
+// local port that creates backpressure via bounded IRSR queues.
+//
+// Topology:
+//
+//   Node(0,0) ←→ Node(1,0)
+//       ↕              ↕
+//   Node(0,1) ←→ Node(1,1)
+//
+// Each node:
+//   - Local Source(Pkt) → FilterXY2 (remove self-addressed packets)
+//   - XYRouter5: 5-port router with XY routing logic
+//   - At local output: Queue(IRSR_DEPTH) as L3 backpressure → Sink
+//
+// Key test scenarios:
+//   - Diagonal traffic (0,0)→(1,1) requires X→Y turn at (1,0)
+//   - Cross traffic (1,0)→(0,1) turns at different points
+//   - L3 IRSR depth limits create backpressure propagating through mesh
+//
+// XY routing is deterministic and proven deadlock-free for meshes
+// without protocol-level dependencies. The IRSR backpressure adds
+// bounded delay but should not create circular waiting.
+//
+// Expected: NO DEADLOCK (XY routing with bounded L3 backpressure)
+// ==========================================================================
+
+param int QSIZE = 2;          // Router input buffer size (VoQ depth)
+param int XDIM = 2;           // Mesh X dimension
+param int YDIM = 2;           // Mesh Y dimension
+param int IRSR_DEPTH = 4;     // L3 IRSR depth (backpressure source)
+
+struct Pkt {
+    destx : [0:0];            // X-coordinate of destination (1 bit for 2×2)
+    desty : [0:0];            // Y-coordinate of destination (1 bit for 2×2)
+};
+
+const tok;
+
+// =====================================================================
+// Macro Library (inline — same as mesh_xy lib/main.madl)
+// =====================================================================
+
+macro FilterXY2 (int xID, int yID, chan input) => chan o {
+    // Filters out packets addressed to local node or out-of-range
+    pred BadPackets (p: Pkt) {
+        (p.destx == xID && p.desty == yID) || p.destx >= XDIM || p.desty >= YDIM
+    };
+    chan toSink;
+    let toSink, o := Switch(input, BadPackets, otherwise);
+    Sink(toSink);
+};
+
+macro deadSource () => chan o {
+  enum empty {};
+  let o := Source(empty);
+};
+
+macro ChannelKill (chan input) => chan o {
+    chan toDeadSink;
+    let o, toDeadSink := Fork(input);
+    DeadSink(toDeadSink);
+};
+
+macro Merge5 (bus<5> inPorts) => chan o {
+    let o := Merge(inPorts[4], Merge(inPorts[3], Merge(inPorts[2], Merge(inPorts[0], inPorts[1]))));
+};
+
+// XY Routing Logic — deterministic dimension-order routing
+macro XYRoutingLogic (int xID, int yID, chan inPort) => bus<5> outPorts {
+    // outPorts[0] = local, [1] = West, [2] = East, [3] = North, [4] = South
+    chan eqx, notEqx;
+    let eqx, notEqx := Switch(inPort, Pkt.destx == xID, otherwise);
+    chan notEqy;
+    let outPorts[0], notEqy := Switch(eqx, Pkt.desty == yID, otherwise);
+    // Route in X dimension first
+    let outPorts[1], outPorts[2] := Switch(notEqx, Pkt.destx < xID, otherwise);
+    // Then Y dimension
+    let outPorts[4], outPorts[3] := Switch(notEqy, Pkt.desty < yID, otherwise);
+};
+
+// 5-port XY Router with input buffers
+macro XYRouter5 (int xID, int yID, bus<5> ins) => bus<5> outs {
+    bus<5> routedInLocal;
+    let routedInLocal  := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[0]));
+
+    bus<5> routedInWest;
+    let routedInWest   := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[1]));
+
+    bus<5> routedInEast;
+    let routedInEast   := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[2]));
+
+    bus<5> routedInNorth;
+    let routedInNorth  := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[3]));
+
+    bus<5> routedInSouth;
+    let routedInSouth  := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[4]));
+
+    for (int i = 0; i < 5; i++) {
+        let outs[i] := Merge5(routedInLocal[i], routedInWest[i], routedInEast[i], routedInNorth[i], routedInSouth[i]);
+    };
+};
+
+// =====================================================================
+// Local Sources — Each node generates packets to all other nodes
+// =====================================================================
+
+bus<XDIM*YDIM> srcs;
+for (int y = 0; y < YDIM; y++) {
+    for (int x = 0; x < XDIM; x++) {
+        let srcs[x + y * XDIM] := FilterXY2(x, y, Source(Pkt));
+    };
+};
+
+// =====================================================================
+// Router Mesh — 2×2 with XY Routing
+// =====================================================================
+
+bus<5*XDIM*YDIM> allOUTS;
+
+// Node(0,0) — bottom-left
+// ins: local=srcs[0], west=None, east=Node(1,0).west_out, north=Node(0,1).south_out, south=None
+let allOUTS[0], allOUTS[1], allOUTS[2], allOUTS[3], allOUTS[4]
+    := XYRouter5(0, 0, srcs[0], deadSource(), allOUTS[1*5+1], allOUTS[XDIM*5+4], deadSource());
+
+// Node(1,0) — bottom-right
+// ins: local=srcs[1], west=Node(0,0).east_out, east=None, north=Node(1,1).south_out, south=None
+let allOUTS[5], allOUTS[6], allOUTS[7], allOUTS[8], allOUTS[9]
+    := XYRouter5(1, 0, srcs[1], allOUTS[0*5+2], deadSource(), allOUTS[(0+1)*XDIM*5+1*5+4], deadSource());
+
+// Node(0,1) — top-left
+// ins: local=srcs[2], west=None, east=Node(1,1).west_out, north=None, south=Node(0,0).north_out
+let allOUTS[10], allOUTS[11], allOUTS[12], allOUTS[13], allOUTS[14]
+    := XYRouter5(0, 1, srcs[2], deadSource(), allOUTS[XDIM*5+1*5+1], deadSource(), allOUTS[0*5+3]);
+
+// Node(1,1) — top-right
+// ins: local=srcs[3], west=Node(0,1).east_out, east=None, north=None, south=Node(1,0).north_out
+let allOUTS[15], allOUTS[16], allOUTS[17], allOUTS[18], allOUTS[19]
+    := XYRouter5(1, 1, srcs[3], allOUTS[XDIM*5+0*5+2], deadSource(), deadSource(), allOUTS[0*5+1*5+3]);
+
+// =====================================================================
+// L3 Backpressure at Local Outputs
+//
+// Each local output passes through an IRSR-depth queue before Sink.
+// This models L3 processing latency and backpressure:
+//   Router local_out → Queue(IRSR_DEPTH) → Sink
+//
+// If IRSR is full, backpressure propagates back through the router,
+// potentially blocking other traffic. XY routing guarantees no
+// circular channel dependency, so this should remain deadlock-free.
+// =====================================================================
+
+for (int i = 0; i < XDIM * YDIM; i++) {
+    // L3 processing: IRSR queue creates bounded backpressure
+    Sink(Queue(IRSR_DEPTH, allOUTS[i * 5]));
+};
+
+// =====================================================================
+// Border Outputs — DeadSink (should never receive traffic)
+// =====================================================================
+
+// Node(0,0): west_out[1] and south_out[4] are at border
+DeadSink(allOUTS[0*5+1]);    // Node(0,0) west out
+DeadSink(allOUTS[0*5+4]);    // Node(0,0) south out
+
+// Node(1,0): east_out[2] and south_out[4] are at border
+DeadSink(allOUTS[1*5+2]);    // Node(1,0) east out
+DeadSink(allOUTS[1*5+4]);    // Node(1,0) south out
+
+// Node(0,1): west_out[1] and north_out[3] are at border
+DeadSink(allOUTS[XDIM*5+0*5+1]);  // Node(0,1) west out
+DeadSink(allOUTS[XDIM*5+0*5+3]);  // Node(0,1) north out
+
+// Node(1,1): east_out[2] and north_out[3] are at border
+DeadSink(allOUTS[XDIM*5+1*5+2]);  // Node(1,1) east out
+DeadSink(allOUTS[XDIM*5+1*5+3]);  // Node(1,1) north out

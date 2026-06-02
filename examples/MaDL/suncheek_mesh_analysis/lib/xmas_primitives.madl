@@ -1,0 +1,17 @@
+// xMAS Extended Primitives
+const tok;
+
+macro Latch (chan input) => chan output {
+    let output := Queue(1, input);
+};
+
+macro CreditCounter (int n, chan consumed) => chan credit_out {
+    chan ps := PatientSource(tok);
+    chan q := Queue(n, ps);
+    let credit_out := CtrlJoin(q, consumed);
+};
+
+macro CreditGate (int init_credits, chan data_in, chan credit_return) => chan data_out {
+    chan credit_pool := Queue(init_credits, credit_return);
+    let data_out := CtrlJoin(data_in, credit_pool);
+};

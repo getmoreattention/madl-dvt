@@ -1,0 +1,79 @@
+// ==========================================================================
+// L07: SF/L3 Overflow — OIRSR Back-Invalidation Deadlock Analysis
+// ==========================================================================
+//
+// Models the interaction between IRSR and OIRSR on the TX SNP channel:
+//
+// SF Overflow → OIRSR allocates entry → sends SnpUnique via TX SNP
+//   → waits for snp_resp → DPB pipeline write → release OIRSR
+//
+// IRSR also sends snoops and child DDR requests via TX SNP.
+// If TX SNP is congested (downstream VoQ full), both IRSR and OIRSR
+// are blocked:
+//   OIRSR blocked → SF can't free entries → new SF allocations fail
+//   IRSR blocked → can't send snoops → can't complete requests → IRSR full
+//   IRSR full → no new requests → pipeline idle → OIRSR can't drain either
+//
+// Expected: NEEDS VERIFICATION (potential deadlock from SNP contention)
+// ==========================================================================
+
+uses lib.suncheek_l3_multi;
+
+enum DKind { wb_k, resp_k };
+struct DFlit { kind : DKind; };
+pred IsWB (p: DFlit) { p.kind == wb_k };
+
+param int IRSR_DEPTH    = 2;
+param int OIRSR_DEPTH   = 2;
+param int WBQ_DEPTH     = 2;
+param int RX_WR_DEPTH   = 4;
+param int RX_RESP_DEPTH = 4;
+param int SNP_FABRIC_Q  = 2;
+
+// =====================================================================
+// Single Node with OIRSR (focused analysis)
+// =====================================================================
+
+chan req := Source(DFlit)[cpu_req];
+
+chan wb_all := Source(DFlit);
+chan wb_only, wb_discard := Switch(wb_all, IsWB, otherwise);
+Sink(wb_discard);
+
+// DDR response (gated by child requests that reach DDR)
+chan ddr_proc := Queue(1, child_from_snp);
+chan resp_gen := Source(DFlit);
+chan resp_discard, resp_only := Switch(resp_gen, IsWB, otherwise);
+Sink(resp_discard);
+chan ddr_resp := CtrlJoin(resp_only, ddr_proc);
+
+// Snoop responses from peer cores
+chan snp_resp := Source(DFlit)[snp_resp_src];
+
+// SF overflow trigger (models pipeline detecting SF capacity miss)
+chan sf_ovf := Source(DFlit)[sf_overflow_src];
+
+// L3 with OIRSR
+chan snp_out, data_out := SuncheekL3Overflow(
+    IRSR_DEPTH, OIRSR_DEPTH, WBQ_DEPTH,
+    RX_WR_DEPTH, RX_RESP_DEPTH,
+    req, wb_only, ddr_resp,
+    snp_resp, sf_ovf
+)[l3_00];
+
+// =====================================================================
+// TX SNP Fabric (shared between IRSR and OIRSR traffic)
+// =====================================================================
+chan snp_fabric := Queue(SNP_FABRIC_Q, snp_out)[snp_fabric_q];
+
+// Route: some to DDR (child req), some to peer cores (snoops)
+chan snp_to_ddr, snp_to_cores := LoadBalancer(snp_fabric)[snp_route];
+
+// DDR processes child requests
+chan child_from_snp := snp_to_ddr;
+
+// Peer core snoops consumed (responses modeled by snp_resp source)
+Sink(snp_to_cores)[snp_core_sink];
+
+// Consume data output
+Sink(data_out)[data_sink];

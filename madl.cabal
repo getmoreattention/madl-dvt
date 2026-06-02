@@ -39,6 +39,7 @@ library
                   Madl.ReachInvariants,
                   Madl.BackInterpolation,
                   Madl.Interpolation,
+                  Madl.ToAut,
                   Echelon.Echelon,
                   Madl.Deadlock.SMT,
                   Madl.Deadlock.Nuxmv,

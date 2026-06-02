@@ -1,0 +1,58 @@
+// Mesh Construction Macros for Suncheek Analysis
+// Adapted from mesh_xy/lib/main.madl
+
+const tok;
+
+// Filter out self-destined and out-of-range packets
+macro FilterXY2 (int xID, int yID, chan input) => chan o {
+    pred BadPackets (p: Pkt) {
+        (p.destx == xID && p.desty == yID) || p.destx >= XDIM || p.desty >= YDIM
+    };
+    chan toSink;
+    let toSink, o := Switch(input, BadPackets, otherwise);
+    Sink(toSink);
+};
+
+// Dead source that never produces data (for boundary ports)
+macro deadSource () => chan o {
+    enum empty {};
+    let o := Source(empty);
+};
+
+// Merge 5 channels
+macro Merge5 (bus<5> inPorts) => chan o {
+    let o := Merge(inPorts[4], Merge(inPorts[3], Merge(inPorts[2], Merge(inPorts[0], inPorts[1]))));
+};
+
+// XY Routing Logic (standard 2D mesh XY deterministic routing)
+// outPorts[0] = local, [1] = west, [2] = east, [3] = north, [4] = south
+macro XYRoutingLogic (int xID, int yID, chan inPort) => bus<5> outPorts {
+    chan eqx, notEqx;
+    let eqx, notEqx := Switch(inPort, Pkt.destx == xID, otherwise);
+    chan notEqy;
+    let outPorts[0], notEqy := Switch(eqx, Pkt.desty == yID, otherwise);
+    let outPorts[1], outPorts[2] := Switch(notEqx, Pkt.destx < xID, otherwise);
+    let outPorts[4], outPorts[3] := Switch(notEqy, Pkt.desty < yID, otherwise);
+};
+
+// Standard 5-port XY Router with input buffers
+macro XYRouter5 (int xID, int yID, bus<5> ins) => bus<5> outs {
+    bus<5> routedInLocal;
+    let routedInLocal := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[0]));
+
+    bus<5> routedInWest;
+    let routedInWest := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[1]));
+
+    bus<5> routedInEast;
+    let routedInEast := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[2]));
+
+    bus<5> routedInNorth;
+    let routedInNorth := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[3]));
+
+    bus<5> routedInSouth;
+    let routedInSouth := XYRoutingLogic(xID, yID, Queue(QSIZE, ins[4]));
+
+    for (int i = 0; i < 5; i++) {
+        let outs[i] := Merge5(routedInLocal[i], routedInWest[i], routedInEast[i], routedInNorth[i], routedInSouth[i]);
+    };
+};

@@ -1,0 +1,48 @@
+// ==========================================================================
+// F01: Multi-flit Packet Through VoQ Chain (Backpressure Model)
+// ==========================================================================
+// Tests whether a 4-flit packet can traverse a chain of 2-flit VoQs
+// using natural xMAS backpressure (no credit mechanism).
+//
+// Architecture mapping:
+//   VoQ depth = 2 flit (§2.2)
+//   Packet = 4 flit (> VoQ depth, requires pipeline flow)
+//
+// Key insight: For a single-source flow, VoQ backpressure alone provides
+// correct flow control. Credit-based Fork chains create artificial
+// coupling between independent flit sources — that coupling is relevant
+// for multi-source contention (F04-F06), not single-flow traversal.
+//
+// Expected: NO DEADLOCK (single flow, pipeline drains progressively)
+// ==========================================================================
+
+const tok;
+
+param int VOQ_FLIT = 2;
+
+// =====================================================================
+// 4 flit sources (one packet, exceeds VoQ depth of 2)
+// =====================================================================
+chan f0 := Source(tok);
+chan f1 := Source(tok);
+chan f2 := Source(tok);
+chan f3 := Source(tok);
+
+// =====================================================================
+// Hop 1: VoQ(2) — flits compete for 2 slots via Merge
+// xMAS Queue provides natural backpressure: blocks input when full
+// =====================================================================
+chan hop1 := Queue(VOQ_FLIT, Merge(Merge(f0, f1), Merge(f2, f3)));
+
+// =====================================================================
+// Hop 2: VoQ(2) — receives from hop1, passes to hop3
+// =====================================================================
+chan hop2 := Queue(VOQ_FLIT, hop1);
+
+// =====================================================================
+// Hop 3: VoQ(2) — receives from hop2, drains to Sink
+// =====================================================================
+chan hop3 := Queue(VOQ_FLIT, hop2);
+
+// Destination: always accepts (infinite consumer)
+Sink(hop3);

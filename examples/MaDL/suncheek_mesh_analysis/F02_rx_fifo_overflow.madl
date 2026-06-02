@@ -1,0 +1,86 @@
+// ==========================================================================
+// F02: RX FIFO + DPB Reassembly Contention
+// ==========================================================================
+//
+// Scenario: Multiple multi-flit packets compete for limited reassembly
+// resources at the destination.
+//
+// Architecture mapping:
+//   RX FIFO = 8 flit (§8.1)
+//   DPB = limited reassembly slots
+//   Max packet = 9 flit (can exceed FIFO!)
+//
+// Model (simplified for SMT tractability):
+//   Source A: 3-flit packet
+//   Source B: 3-flit packet  
+//   Shared RX FIFO: 4 flit (simulates capacity pressure)
+//   DPB: 2 slots (simulates limited reassembly)
+//
+// Deadlock scenario:
+//   [1] A's 2 flits enter FIFO → route to DPB slot 1
+//   [2] B's 2 flits enter FIFO → route to DPB slot 2
+//   [3] FIFO is full (4 flit = 2+2)
+//   [4] A's 3rd flit can't enter FIFO (full)
+//   [5] DPB slot 1 waits for A's 3rd flit → can't release
+//   [6] B's 3rd flit can't enter FIFO (full)
+//   [7] DPB slot 2 waits for B's 3rd flit → can't release
+//   [8] FIFO can't drain (DPB full) → circular wait → DEADLOCK
+//
+// Expected: DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int RX_FIFO = 4;     // Shared FIFO depth (flit)
+param int DPB_DEPTH = 2;   // Reassembly slots (DPB entries)
+param int WBQ_DEPTH = 2;   // Downstream processing depth
+
+// =====================================================================
+// Source A: 3-flit packet
+// =====================================================================
+chan a0 := Source(tok);
+chan a1 := Source(tok);
+chan a2 := Source(tok);
+
+// =====================================================================
+// Source B: 3-flit packet
+// =====================================================================
+chan b0 := Source(tok);
+chan b1 := Source(tok);
+chan b2 := Source(tok);
+
+// =====================================================================
+// Shared RX FIFO (4 flit): all 6 flit sources compete
+// No credit mechanism — Queue backpressure is the flow control
+// =====================================================================
+chan fifo := Queue(RX_FIFO, Merge(Merge(a0, Merge(a1, a2)), Merge(b0, Merge(b1, b2))));
+
+// =====================================================================
+// DPB: Limited reassembly buffer
+// Routes flits to one of 2 reassembly slots
+// Each slot must accumulate flits before releasing
+// =====================================================================
+chan to_slot_a, to_slot_b := LoadBalancer(fifo);
+
+// DPB slot A: limited depth, blocks when full
+chan dpb_a := Queue(DPB_DEPTH, to_slot_a);
+
+// DPB slot B: limited depth, blocks when full
+chan dpb_b := Queue(DPB_DEPTH, to_slot_b);
+
+// =====================================================================
+// Processing: each DPB slot feeds IRSR/pipeline
+// Pipeline blocks when IRSR is full → DPB can't drain → FIFO blocks
+// =====================================================================
+chan irsr := Queue(2, Merge(dpb_a, dpb_b));
+chan hit, miss := LoadBalancer(irsr);
+Sink(hit);
+
+// Miss path: needs downstream response to complete
+chan wait_tok, child_tok := Fork(miss);
+Sink(child_tok);
+
+// Response comes back via a limited channel
+chan resp := Queue(1, PatientSource(tok));
+chan done := CtrlJoin(wait_tok, resp);
+Sink(done);

@@ -1,0 +1,79 @@
+// ==========================================================================
+// L04: 2x2 Mesh — Separated DATA FIFOs (Fix for L03)
+// ==========================================================================
+//
+// Models L3 Architecture §9.1 solution:
+//   Two L3 nodes with SEPARATED rx_data FIFOs.
+//   WB data → dedicated wr_fifo (discriminated by is_sn=0)
+//   DDR response → dedicated resp_fifo (discriminated by is_sn=1)
+//
+// Fix mechanism:
+//   Even when wr_fifo is full (WBQ backpressure), resp_fifo can still
+//   drain DDR responses. IRSR miss entries complete, freeing IRSR slots.
+//   No HOL blocking between WB and DDR response traffic.
+//
+// Same topology as L03 but with separated FIFOs per L3 node.
+//
+// Expected: NO DEADLOCK
+// ==========================================================================
+
+uses lib.suncheek_l3_multi;
+
+enum DKind { wb_k, resp_k };
+struct DFlit { kind : DKind; };
+pred IsWB (p: DFlit) { p.kind == wb_k };
+
+param int IRSR_DEPTH    = 2;
+param int WBQ_DEPTH     = 2;
+param int RX_WR_DEPTH   = 4;
+param int RX_RESP_DEPTH = 4;
+
+// =====================================================================
+// Node A
+// =====================================================================
+
+// Read requests from CPU_A
+chan req_a := Source(DFlit)[cpu_req_a];
+
+// WB traffic from CPU_A (wb_k only)
+chan wb_all_a := Source(DFlit);
+chan wb_a, wb_discard_a := Switch(wb_all_a, IsWB, otherwise);
+Sink(wb_discard_a);
+
+// DDR response for Node A (resp_k only, gated by DDR processing)
+chan ddr_proc_a := Queue(1, child_a);
+chan resp_gen_a := Source(DFlit);
+chan resp_discard_a, resp_a := Switch(resp_gen_a, IsWB, otherwise);
+Sink(resp_discard_a);
+chan ddr_resp_a := CtrlJoin(resp_a, ddr_proc_a)[ddr_turnaround_a];
+
+// L3 Node A with SEPARATED DATA FIFOs
+chan child_a := SuncheekL3Separated(
+    IRSR_DEPTH, WBQ_DEPTH, RX_WR_DEPTH, RX_RESP_DEPTH,
+    req_a, wb_a, ddr_resp_a
+)[l3_a];
+
+// =====================================================================
+// Node B
+// =====================================================================
+
+// Read requests from CPU_B
+chan req_b := Source(DFlit)[cpu_req_b];
+
+// WB traffic from CPU_B (wb_k only)
+chan wb_all_b := Source(DFlit);
+chan wb_b, wb_discard_b := Switch(wb_all_b, IsWB, otherwise);
+Sink(wb_discard_b);
+
+// DDR response for Node B (resp_k only, gated by DDR processing)
+chan ddr_proc_b := Queue(1, child_b);
+chan resp_gen_b := Source(DFlit);
+chan resp_discard_b, resp_b := Switch(resp_gen_b, IsWB, otherwise);
+Sink(resp_discard_b);
+chan ddr_resp_b := CtrlJoin(resp_b, ddr_proc_b)[ddr_turnaround_b];
+
+// L3 Node B with SEPARATED DATA FIFOs
+chan child_b := SuncheekL3Separated(
+    IRSR_DEPTH, WBQ_DEPTH, RX_WR_DEPTH, RX_RESP_DEPTH,
+    req_b, wb_b, ddr_resp_b
+)[l3_b];

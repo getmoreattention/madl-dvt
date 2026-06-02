@@ -1,0 +1,147 @@
+// ==========================================================================
+// 04a: Data Channel RX FIFO Deadlock — Mesh-Level Shared FIFO
+// ==========================================================================
+//
+// Spec source: L3 Architecture §9.1, §8.1
+//
+// Scenario (2x2 mesh, two L3 nodes):
+//   Each L3 node has a SINGLE shared RX Data FIFO that carries both:
+//     - wr_req  (RN→HN): WriteBack_Custom from CPU clusters
+//     - respdata (SN→HN): CompData from DDR controllers
+//
+//   Deadlock chain per node:
+//     [1] L3 miss → ReadNoSnp → DDR → IRSR waits for CompData
+//     [2] CPU continuously issues WriteBack → fills shared RX FIFO
+//     [3] DDR CompData arrives → cannot enter FIFO (full of WB data)
+//     [4] WBQ full → cannot pop WB from FIFO → FIFO stays full
+//     [5] IRSR waits for CompData to complete → CompData blocked → cycle
+//
+//   Cross-node amplification:
+//     L3_A miss → ReadNoSnp to DDR_X → DDR_X response blocked at L3_A
+//     L3_B miss → ReadNoSnp to DDR_Y → DDR_Y response blocked at L3_B
+//     Both nodes' WBQ full → both nodes deadlocked
+//
+// Parameters:
+//   RX FIFO depth = 8 (L3 Architecture §8.1)
+//   IRSR entries  = 2 (simplified for fast triggering)
+//   WBQ depth     = 2 (simplified)
+//
+// Expected result: DEADLOCK (Z3 SAT)
+// ==========================================================================
+
+const tok;
+
+param int FIFO_DEPTH = 8;     // L3 Architecture §8.1: RX FIFO depth
+param int IRSR_DEPTH = 2;
+param int WBQ_DEPTH  = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// Node A — Traffic sources
+// =====================================================================
+chan cpu_wb_a   := Source(tok);      // CPU Cluster A WriteBack_Custom
+chan ddr_resp_a := Source(tok);      // DDR CompData destined for L3_A
+
+// =====================================================================
+// Node A — Shared RX FIFO (deadlock root cause)
+//
+// §9.1: "WBQ full → RX FIFO cannot pop → read response data
+//         blocked by write requests in the same FIFO"
+// =====================================================================
+
+// Credit flow control: L3 releases credit after consuming FIFO entry
+chan fifo_out_a, fifo_consumed_a := Fork(Queue(FIFO_DEPTH, Merge(cpu_wb_a_gated, ddr_resp_a_gated)));
+chan credit_data_a := CreditCounter(FIFO_DEPTH, fifo_consumed_a);
+
+// Both sources gated by the SAME credit pool
+chan credit_wb_a, credit_resp_a := Fork(credit_data_a);
+chan cpu_wb_a_gated   := CtrlJoin(cpu_wb_a, credit_wb_a);
+chan ddr_resp_a_gated := CtrlJoin(ddr_resp_a, credit_resp_a);
+
+// =====================================================================
+// Node A — L3 internal processing
+// =====================================================================
+
+// Split WB vs CompData (non-deterministic, models opcode decode)
+chan wb_path_a, resp_path_a := LoadBalancer(fifo_out_a);
+
+// WBQ: process WriteBack
+chan wbq_a := Queue(WBQ_DEPTH, wb_path_a);
+chan wb_done_a, wb_trigger_a := Fork(wbq_a);
+Sink(wb_done_a);
+
+// IRSR: read requests (WB triggers L3 miss, simplified)
+chan irsr_a := Queue(IRSR_DEPTH, wb_trigger_a);
+chan hit_a, miss_a := LoadBalancer(irsr_a);
+Sink(hit_a);
+
+// Miss → ReadNoSnp → DDR (child request)
+chan child_tok_a, wait_tok_a := Fork(miss_a);
+chan child_src_a := Source(tok);
+chan child_req_a := CtrlJoin(child_src_a, child_tok_a);
+Sink(child_req_a);
+
+// Wait for DDR CompData to return
+chan wait_q_a := Queue(IRSR_DEPTH, wait_tok_a);
+chan done_a   := CtrlJoin(wait_q_a, resp_path_a);
+Sink(done_a);
+
+// =====================================================================
+// Node B — Traffic sources
+// =====================================================================
+chan cpu_wb_b   := Source(tok);      // CPU Cluster B WriteBack_Custom
+chan ddr_resp_b := Source(tok);      // DDR CompData destined for L3_B
+
+// =====================================================================
+// Node B — Shared RX FIFO (same deadlock pattern as Node A)
+// =====================================================================
+
+chan fifo_out_b, fifo_consumed_b := Fork(Queue(FIFO_DEPTH, Merge(cpu_wb_b_gated, ddr_resp_b_gated)));
+chan credit_data_b := CreditCounter(FIFO_DEPTH, fifo_consumed_b);
+
+chan credit_wb_b, credit_resp_b := Fork(credit_data_b);
+chan cpu_wb_b_gated   := CtrlJoin(cpu_wb_b, credit_wb_b);
+chan ddr_resp_b_gated := CtrlJoin(ddr_resp_b, credit_resp_b);
+
+// =====================================================================
+// Node B — L3 internal processing
+// =====================================================================
+
+chan wb_path_b, resp_path_b := LoadBalancer(fifo_out_b);
+
+// WBQ
+chan wbq_b := Queue(WBQ_DEPTH, wb_path_b);
+chan wb_done_b, wb_trigger_b := Fork(wbq_b);
+Sink(wb_done_b);
+
+// IRSR
+chan irsr_b := Queue(IRSR_DEPTH, wb_trigger_b);
+chan hit_b, miss_b := LoadBalancer(irsr_b);
+Sink(hit_b);
+
+// Miss → ReadNoSnp → DDR (child request)
+chan child_tok_b, wait_tok_b := Fork(miss_b);
+chan child_src_b := Source(tok);
+chan child_req_b := CtrlJoin(child_src_b, child_tok_b);
+Sink(child_req_b);
+
+// Wait for DDR CompData
+chan wait_q_b := Queue(IRSR_DEPTH, wait_tok_b);
+chan done_b   := CtrlJoin(wait_q_b, resp_path_b);
+Sink(done_b);
+
+// =====================================================================
+// Cross-node coupling: DDR responses must traverse mesh
+//
+// Node A's CompData comes from DDR via Node B's output (and vice versa).
+// The cross-node dependency means BOTH nodes must be functional for
+// either to make progress — amplifying the deadlock.
+// =====================================================================
+// (Already modeled: each node's DDR response Source is independently
+//  blocked by that node's shared FIFO. In a mesh, these Sources
+//  represent traffic arriving from DDR agents at mesh edges.)

@@ -1,0 +1,138 @@
+// ==========================================================================
+// M02: 1×2 East-West — Two Suncheek Nodes with L3 Protocol Dependencies
+// ==========================================================================
+//
+// Layer 2 of incremental mesh deadlock analysis.
+//
+// Topology:
+//
+//   CPU_0 → [L3_0] ──east_req──→ [VoQ_E(2)] → [L3_1] ← CPU_1
+//                   ←east_resp──  [VoQ_W(2)] ←
+//
+//   Node_0 at position (0,0), Node_1 at position (1,0)
+//   Connected via East-West links with separate VoQs per direction.
+//
+// Key dependency chain:
+//   Node_0: req → miss → east VoQ → Node_1
+//   Node_1: processes → response → west VoQ → Node_0
+//   Node_0: receives response → completes miss
+//   AND symmetrically Node_1 → Node_0.
+//
+// Design decision:
+//   Separate Queue for req and resp per direction prevents deadlock.
+//   Requests use VoQ_east_req / VoQ_west_req
+//   Responses use VoQ_east_resp / VoQ_west_resp
+//
+// Parameters:
+//   VoQ depth    = 2   (NoC spec §4.1)
+//   Credit init  = 5   (NoC spec §4.3)
+//   IRSR depth   = 4   (L3 Spec §2.3)
+//
+// Expected: NO DEADLOCK (separate VoQs for req vs resp)
+// ==========================================================================
+
+const tok;
+
+param int VOQ_DEPTH    = 2;    // NoC spec §4.1
+param int CREDIT_INIT  = 5;    // NoC spec §4.3
+param int IRSR_DEPTH   = 4;    // L3 Spec §2.3
+
+// =====================================================================
+// CreditCounter macro
+// =====================================================================
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// CPU Sources — Local traffic generators
+// =====================================================================
+chan cpu0 := Source(tok);   // CPU at Node_0 generating requests
+chan cpu1 := Source(tok);   // CPU at Node_1 generating requests
+
+// =====================================================================
+// Node_0 L3 Pipeline
+// =====================================================================
+
+// IRSR receives local CPU requests
+chan irsr0 := Queue(IRSR_DEPTH, cpu0);
+
+// Hit/Miss decision
+chan hit0, miss0 := LoadBalancer(irsr0);
+Sink(hit0);
+
+// Miss: generate child request → route to Node_1 via east link
+chan child0_tok, wait0_tok := Fork(miss0);
+chan child0_src := Source(tok);
+chan child0 := CtrlJoin(child0_src, child0_tok);
+
+// =====================================================================
+// Node_1 L3 Pipeline
+// =====================================================================
+
+chan irsr1 := Queue(IRSR_DEPTH, cpu1);
+
+chan hit1, miss1 := LoadBalancer(irsr1);
+Sink(hit1);
+
+// Miss: generate child request → route to Node_0 via west link
+chan child1_tok, wait1_tok := Fork(miss1);
+chan child1_src := Source(tok);
+chan child1 := CtrlJoin(child1_src, child1_tok);
+
+// =====================================================================
+// East-West Links — Separate VoQs for Requests and Responses
+// =====================================================================
+
+// --- East direction: Node_0 → Node_1 ---
+
+// Request VoQ: carries child requests from Node_0 to Node_1
+chan voq_east_req_out, voq_east_req_consumed := Fork(Queue(VOQ_DEPTH, child0));
+chan credit_east_req := CreditCounter(CREDIT_INIT, voq_east_req_consumed);
+// Credit gates child0 generation (already gated by CtrlJoin above)
+Sink(credit_east_req);  // Credits consumed implicitly via flow control
+
+// Node_1 receives request from Node_0 → process → generate response
+chan n1_process, n1_pass := Fork(voq_east_req_out);
+Sink(n1_pass);  // Simplified: request processing at Node_1
+
+// Node_1 generates response back to Node_0
+chan resp1_src := Source(tok);
+chan resp1 := CtrlJoin(resp1_src, n1_process);
+
+// Response VoQ: carries responses from Node_1 back to Node_0
+chan voq_west_resp_out, voq_west_resp_consumed := Fork(Queue(VOQ_DEPTH, resp1));
+chan credit_west_resp := CreditCounter(CREDIT_INIT, voq_west_resp_consumed);
+Sink(credit_west_resp);
+
+// Node_0 receives response → completes miss
+chan wait0_q := Queue(IRSR_DEPTH, wait0_tok);
+chan done0 := CtrlJoin(wait0_q, voq_west_resp_out);
+Sink(done0);
+
+// --- West direction: Node_1 → Node_0 ---
+
+// Request VoQ: carries child requests from Node_1 to Node_0
+chan voq_west_req_out, voq_west_req_consumed := Fork(Queue(VOQ_DEPTH, child1));
+chan credit_west_req := CreditCounter(CREDIT_INIT, voq_west_req_consumed);
+Sink(credit_west_req);
+
+// Node_0 receives request from Node_1 → process → generate response
+chan n0_process, n0_pass := Fork(voq_west_req_out);
+Sink(n0_pass);
+
+// Node_0 generates response back to Node_1
+chan resp0_src := Source(tok);
+chan resp0 := CtrlJoin(resp0_src, n0_process);
+
+// Response VoQ: carries responses from Node_0 back to Node_1
+chan voq_east_resp_out, voq_east_resp_consumed := Fork(Queue(VOQ_DEPTH, resp0));
+chan credit_east_resp := CreditCounter(CREDIT_INIT, voq_east_resp_consumed);
+Sink(credit_east_resp);
+
+// Node_1 receives response → completes miss
+chan wait1_q := Queue(IRSR_DEPTH, wait1_tok);
+chan done1 := CtrlJoin(wait1_q, voq_east_resp_out);
+Sink(done1);

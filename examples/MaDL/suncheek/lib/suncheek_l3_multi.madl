@@ -1,0 +1,280 @@
+// ==========================================================================
+// Suncheek L3 Cache Multi-Channel Protocol Agent
+// ==========================================================================
+//
+// Extended L3 macros for deadlock verification of multi-channel CHI flows.
+// Models the DATA channel WB/resp separation and parent-child dependencies.
+//
+// Key deadlock scenarios modeled:
+//   1. Shared DATA FIFO: WB + DDR resp share one Queue → HOL blocking
+//   2. IRSR + WBQ resource contention: WB needs pipeline, reads need IRSR
+//   3. Snoop channel: child DDR req vs broadcast snoop contention
+//   4. OIRSR: SF overflow back-invalidation vs IRSR snoop contention
+//
+// Packet Types:
+//   DFlit: Data channel flit with kind field for WB/resp discrimination
+//   tok: Generic token for non-data channels
+//
+// ==========================================================================
+
+enum DKind { wb_k, resp_k };
+struct DFlit { kind : DKind; };
+pred IsWB (p: DFlit) { p.kind == wb_k };
+
+const tok;
+
+// ==========================================================================
+// SuncheekL3Shared: L3 with SHARED DATA FIFO (Deadlock Scenario)
+// ==========================================================================
+//
+// Models L3 Architecture §9.1 deadlock:
+//   WB data and DDR response data share a single rx_data FIFO.
+//   When WBQ backpressures, WB tokens block at the Switch output,
+//   causing HOL blocking that prevents DDR response tokens from
+//   reaching the IRSR miss completion path.
+//
+// Deadlock cycle:
+//   IRSR full (all miss) → waits for DDR resp → resp blocked in shared FIFO
+//   → shared FIFO blocked by WB at head → WBQ full → circular dependency
+//
+// Inputs:
+//   req_in      - Read request channel (DFlit, kind ignored)
+//   shared_data - Mixed WB + DDR response data channel (DFlit, kind used)
+// Output:
+//   child_req   - Child request to DDR (DFlit)
+//
+macro SuncheekL3Shared (int irsr_depth, int wbq_depth, int rx_depth,
+                         chan req_in, chan shared_data) => chan child_req {
+    // ---- Read Request Pipeline through IRSR ----
+    chan irsr := Queue(irsr_depth, req_in);
+    chan hit, miss := LoadBalancer(irsr);
+    Sink(hit);
+
+    // Miss: fork into child DDR request + wait for response
+    chan child, wait := Fork(miss);
+    let child_req := child;
+
+    // ---- Shared DATA FIFO (DEADLOCK ROOT CAUSE) ----
+    // Single Queue for both WB and DDR response tokens
+    chan data_q := Queue(rx_depth, shared_data);
+
+    // Deterministic routing by kind field (models is_sn bit decode)
+    // HOL blocking: if WB token at head and WBQ full → Queue blocked
+    chan wb_raw, resp_raw := Switch(data_q, IsWB, otherwise);
+
+    // WBQ: bounded writeback processing buffer
+    // When full, wb_raw blocks → Switch blocks → data_q blocks → resp stuck
+    chan wbq := Queue(wbq_depth, wb_raw);
+    Sink(wbq);
+
+    // Resp path: feeds IRSR miss completion
+    chan wait_q := Queue(irsr_depth, wait);
+    chan done := CtrlJoin(wait_q, resp_raw);
+    Sink(done);
+};
+
+
+// ==========================================================================
+// SuncheekL3Separated: L3 with SEPARATED DATA FIFOs (Fix)
+// ==========================================================================
+//
+// Models L3 Architecture §9.1 solution:
+//   WB data and DDR response data use independent rx FIFOs.
+//   The is_sn bit in the data flit discriminates them at the router
+//   output BEFORE entering the FIFOs, so they never share buffer space.
+//
+// No HOL blocking: even if wr_fifo is full, resp_fifo can still drain.
+//
+// Inputs:
+//   req_in   - Read request channel (DFlit, kind ignored)
+//   wb_in    - Write request data channel (DFlit, wb_k only)
+//   resp_in  - DDR response data channel (DFlit, resp_k only)
+// Output:
+//   child_req - Child request to DDR (DFlit)
+//
+macro SuncheekL3Separated (int irsr_depth, int wbq_depth, int rx_wr_depth,
+                            int rx_resp_depth,
+                            chan req_in, chan wb_in, chan resp_in) => chan child_req {
+    // ---- Read Request Pipeline through IRSR ----
+    chan irsr := Queue(irsr_depth, req_in);
+    chan hit, miss := LoadBalancer(irsr);
+    Sink(hit);
+
+    // Miss path
+    chan child, wait := Fork(miss);
+    let child_req := child;
+
+    // ---- Separated WB FIFO (independent from resp) ----
+    chan wb_fifo := Queue(rx_wr_depth, wb_in);
+    chan wbq := Queue(wbq_depth, wb_fifo);
+    Sink(wbq);
+
+    // ---- Separated Resp FIFO (independent from WB) ----
+    chan resp_fifo := Queue(rx_resp_depth, resp_in);
+
+    // Resp feeds IRSR miss completion (no HOL blocking from WB)
+    chan wait_q := Queue(irsr_depth, wait);
+    chan done := CtrlJoin(wait_q, resp_fifo);
+    Sink(done);
+};
+
+
+// ==========================================================================
+// SuncheekL3Snoop: L3 with Snoop Channel Flows
+// ==========================================================================
+//
+// Extends L3Separated with snoop generation and response handling:
+//   - Read miss: send snoop to peer cores + child DDR request
+//   - Wait for snp_resp before sending CompData
+//   - WB: send SnpQuery → wait snp_resp → SnpComp_Custom
+//
+// Models contention on TX SNP channel (shared between:
+//   1. Read miss snoops (broadcast SnpNotSharedDirtyFwd)
+//   2. Child DDR requests (SnpReadNoSnp_Custom via SNP channel)
+//   3. WB SnpComp_Custom
+//
+// Inputs:
+//   req_in      - Read request channel
+//   wb_in       - Write request data channel
+//   resp_in     - DDR response data channel
+//   snp_resp_in - Snoop response channel from peer cores
+// Outputs:
+//   snp_out     - TX SNP: snoops + SnpReadNoSnp_Custom + SnpComp_Custom
+//   data_out    - TX DATA: CompData responses to requesters
+//
+macro SuncheekL3Snoop (int irsr_depth, int wbq_depth,
+                        int rx_wr_depth, int rx_resp_depth,
+                        chan req_in, chan wb_in, chan resp_in,
+                        chan snp_resp_in) => chan snp_out, chan data_out {
+    // ---- Read Request Pipeline through IRSR ----
+    chan irsr := Queue(irsr_depth, req_in);
+    chan hit, miss := LoadBalancer(irsr);
+
+    // Hit: CompData from L3 → data_out
+    chan hit_src := Source(DFlit);
+    chan hit_data := CtrlJoin(hit_src, hit);
+
+    // Miss: 3-way fork → {snoop, child DDR, wait for resp}
+    chan miss_snp_tok, miss_rest := Fork(miss);
+    chan miss_child_tok, miss_wait_tok := Fork(miss_rest);
+
+    // [1] Snoop to peer cores (via TX SNP)
+    chan snp_bcast_src := Source(DFlit);
+    chan snp_broadcast := CtrlJoin(snp_bcast_src, miss_snp_tok);
+
+    // [2] Child DDR request (SnpReadNoSnp_Custom via TX SNP)
+    chan child_src := Source(DFlit);
+    chan child_req := CtrlJoin(child_src, miss_child_tok);
+
+    // [3] Wait for DDR response + snoop responses
+    chan resp_fifo := Queue(rx_resp_depth, resp_in);
+    chan wait_q := Queue(irsr_depth, miss_wait_tok);
+    chan ddr_synced := CtrlJoin(wait_q, resp_fifo);
+
+    // Also wait for snoop responses from peer cores
+    chan snp_resp_q := Queue(irsr_depth, snp_resp_in);
+    chan all_synced := CtrlJoin(ddr_synced, snp_resp_q);
+
+    // Generate CompData response to requester
+    chan miss_data_src := Source(DFlit);
+    chan miss_data := CtrlJoin(miss_data_src, all_synced);
+
+    // ---- WB Processing ----
+    chan wb_fifo := Queue(rx_wr_depth, wb_in);
+    chan wbq := Queue(wbq_depth, wb_fifo);
+
+    // WB sends SnpComp_Custom via TX SNP after processing
+    chan wb_snp_src := Source(DFlit);
+    chan wb_snp := CtrlJoin(wb_snp_src, wbq);
+
+    // ---- TX outputs ----
+    // TX SNP: merge all snoop-channel traffic
+    let snp_out := Merge(snp_broadcast, Merge(child_req, wb_snp));
+
+    // TX DATA: merge hit and miss CompData responses
+    let data_out := Merge(hit_data, miss_data);
+};
+
+
+// ==========================================================================
+// SuncheekL3Overflow: L3 with SF/L3 Overflow (OIRSR)
+// ==========================================================================
+//
+// Adds OIRSR path for SF overflow back-invalidation:
+//   SF overflow → OIRSR allocation → SnpUnique via TX SNP
+//   → wait for snp_resp → DPB write → release OIRSR
+//
+// Potential deadlock: OIRSR snoops compete with IRSR snoops
+//   for TX SNP channel. If TX SNP is congested, both OIRSR and IRSR
+//   are blocked → SF can't free entries → IRSR can't allocate SF entries
+//   → IRSR blocks → more pressure on TX SNP → cycle
+//
+// Inputs:
+//   req_in       - Read request channel
+//   wb_in        - Write request data channel
+//   resp_in      - DDR response data channel
+//   snp_resp_in  - Snoop response from peer cores
+//   sf_overflow  - SF overflow trigger (from pipeline SF miss detection)
+// Outputs:
+//   snp_out      - TX SNP (IRSR snoops + OIRSR snoops + child DDR req)
+//   data_out     - TX DATA (CompData + WriteNoSnp to DDR)
+//
+macro SuncheekL3Overflow (int irsr_depth, int oirsr_depth, int wbq_depth,
+                           int rx_wr_depth, int rx_resp_depth,
+                           chan req_in, chan wb_in, chan resp_in,
+                           chan snp_resp_in, chan sf_overflow)
+                           => chan snp_out, chan data_out {
+    // ---- IRSR Path (same as L3Snoop) ----
+    chan irsr := Queue(irsr_depth, req_in);
+    chan hit, miss := LoadBalancer(irsr);
+
+    chan hit_src := Source(DFlit);
+    chan hit_data := CtrlJoin(hit_src, hit);
+
+    chan miss_snp, miss_rest := Fork(miss);
+    chan miss_child, miss_wait := Fork(miss_rest);
+
+    chan snp_bcast_src := Source(DFlit);
+    chan snp_broadcast := CtrlJoin(snp_bcast_src, miss_snp);
+
+    chan child_src := Source(DFlit);
+    chan child_req := CtrlJoin(child_src, miss_child);
+
+    chan resp_fifo := Queue(rx_resp_depth, resp_in);
+    chan wait_q := Queue(irsr_depth, miss_wait);
+    chan ddr_synced := CtrlJoin(wait_q, resp_fifo);
+
+    // Split snp_resp between IRSR and OIRSR consumers
+    chan snp_resp_irsr, snp_resp_oirsr := LoadBalancer(snp_resp_in);
+    chan snp_resp_q := Queue(irsr_depth, snp_resp_irsr);
+    chan all_synced := CtrlJoin(ddr_synced, snp_resp_q);
+
+    chan miss_data_src := Source(DFlit);
+    chan miss_data := CtrlJoin(miss_data_src, all_synced);
+
+    // ---- WB Path ----
+    chan wb_fifo := Queue(rx_wr_depth, wb_in);
+    chan wbq := Queue(wbq_depth, wb_fifo);
+    chan wb_snp_src := Source(DFlit);
+    chan wb_snp := CtrlJoin(wb_snp_src, wbq);
+
+    // ---- OIRSR Path (SF Overflow Back-Invalidation) ----
+    chan oirsr := Queue(oirsr_depth, sf_overflow);
+
+    // OIRSR sends SnpUnique to victim core(s) via TX SNP
+    chan oirsr_snp_src := Source(DFlit);
+    chan oirsr_snp := CtrlJoin(oirsr_snp_src, oirsr);
+
+    // OIRSR waits for snoop response
+    chan oirsr_snp_sent, oirsr_wait := Fork(oirsr_snp);
+    chan oirsr_snp_resp_q := Queue(oirsr_depth, snp_resp_oirsr);
+    chan oirsr_done := CtrlJoin(oirsr_wait, oirsr_snp_resp_q);
+    Sink(oirsr_done);
+
+    // ---- TX SNP: merge ALL snoop channel traffic ----
+    // Contention point: IRSR snoops + child DDR req + WB SnpComp + OIRSR snoops
+    let snp_out := Merge(snp_broadcast, Merge(child_req, Merge(wb_snp, oirsr_snp_sent)));
+
+    // ---- TX DATA ----
+    let data_out := Merge(hit_data, miss_data);
+};

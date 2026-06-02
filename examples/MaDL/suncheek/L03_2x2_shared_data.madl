@@ -1,0 +1,86 @@
+// ==========================================================================
+// L03: 2x2 Mesh — Shared DATA FIFO Deadlock Scenario
+// ==========================================================================
+//
+// Models L3 Architecture §9.1 deadlock:
+//   Two L3 nodes with SHARED rx_data FIFO (WB + DDR response mixed).
+//   Each node's WB data and DDR response compete for the same FIFO.
+//
+// Deadlock chain:
+//   [1] IRSR has miss entries → waiting for DDR response data
+//   [2] CPUs generate WriteBack data → enters shared DATA FIFO
+//   [3] WBQ full → WB token stuck at Switch output → HOL blocking
+//   [4] DDR response behind WB in shared FIFO → can't reach IRSR
+//   [5] IRSR can't complete → stays full → goto [2] → CIRCULAR
+//
+// Uses DFlit with kind field for deterministic Switch routing
+// (models the is_sn bit in real hardware).
+//
+// Expected: DEADLOCK (HOL blocking in shared DATA FIFO)
+// ==========================================================================
+
+uses lib.suncheek_l3_multi;
+
+enum DKind { wb_k, resp_k };
+struct DFlit { kind : DKind; };
+pred IsWB (p: DFlit) { p.kind == wb_k };
+
+param int IRSR_DEPTH = 2;
+param int WBQ_DEPTH  = 2;
+param int RX_DEPTH   = 4;
+
+// =====================================================================
+// Node A
+// =====================================================================
+
+// Read requests from CPU_A
+chan req_a := Source(DFlit)[cpu_req_a];
+
+// WB traffic from CPU_A (wb_k only)
+chan wb_all_a := Source(DFlit);
+chan wb_a, wb_discard_a := Switch(wb_all_a, IsWB, otherwise);
+Sink(wb_discard_a);
+
+// DDR response for Node A (resp_k only, gated by DDR processing)
+chan ddr_proc_a := Queue(1, child_a);
+chan resp_gen_a := Source(DFlit);
+chan resp_discard_a, resp_a := Switch(resp_gen_a, IsWB, otherwise);
+Sink(resp_discard_a);
+chan ddr_resp_a := CtrlJoin(resp_a, ddr_proc_a);
+
+// SHARED: Merge WB and DDR response into one data channel
+chan shared_data_a := Merge(wb_a, ddr_resp_a)[shared_merge_a];
+
+// L3 Node A with shared DATA FIFO
+chan child_a := SuncheekL3Shared(
+    IRSR_DEPTH, WBQ_DEPTH, RX_DEPTH,
+    req_a, shared_data_a
+)[l3_a];
+
+// =====================================================================
+// Node B
+// =====================================================================
+
+// Read requests from CPU_B
+chan req_b := Source(DFlit)[cpu_req_b];
+
+// WB traffic from CPU_B (wb_k only)
+chan wb_all_b := Source(DFlit);
+chan wb_b, wb_discard_b := Switch(wb_all_b, IsWB, otherwise);
+Sink(wb_discard_b);
+
+// DDR response for Node B (resp_k only, gated by DDR processing)
+chan ddr_proc_b := Queue(1, child_b);
+chan resp_gen_b := Source(DFlit);
+chan resp_discard_b, resp_b := Switch(resp_gen_b, IsWB, otherwise);
+Sink(resp_discard_b);
+chan ddr_resp_b := CtrlJoin(resp_b, ddr_proc_b);
+
+// SHARED: Merge WB and DDR response into one data channel
+chan shared_data_b := Merge(wb_b, ddr_resp_b)[shared_merge_b];
+
+// L3 Node B with shared DATA FIFO
+chan child_b := SuncheekL3Shared(
+    IRSR_DEPTH, WBQ_DEPTH, RX_DEPTH,
+    req_b, shared_data_b
+)[l3_b];

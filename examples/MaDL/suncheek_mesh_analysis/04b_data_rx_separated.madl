@@ -1,0 +1,119 @@
+// ==========================================================================
+// 04b: Data Channel RX FIFO Fix — Separated FIFOs (Mesh-Level)
+// ==========================================================================
+//
+// Spec source: L3 Architecture §9.1 solution, §8.1
+//
+// Fix applied to both mesh nodes:
+//   Separate respdata FIFO (depth 8, discriminated by is_sn bit)
+//   wr_req and respdata no longer share buffer space.
+//
+//   wr_req FIFO:   WriteBack_Custom, WriteClean_Custom, NCBWrdata only
+//   respdata FIFO: CompData (DDR response) only
+//
+// Key insight:
+//   Even if wr_req FIFO is full (WBQ backpressure), respdata FIFO
+//   can still pop CompData. L3 IRSR completes, releases WBQ entries,
+//   breaking the circular dependency.
+//
+// Expected result: NO DEADLOCK
+// ==========================================================================
+
+const tok;
+
+param int FIFO_DEPTH = 8;     // L3 Architecture §8.1
+param int IRSR_DEPTH = 2;
+param int WBQ_DEPTH  = 2;
+
+macro CreditCounter(int n, chan consumed) => chan credit {
+    chan q_in;
+    let q_in, credit := Fork(PatientSource(tok));
+    Sink(CtrlJoin(Queue(n, q_in), consumed));
+};
+
+// =====================================================================
+// Node A — Traffic sources
+// =====================================================================
+chan cpu_wb_a   := Source(tok);      // CPU Cluster A WriteBack_Custom
+chan ddr_resp_a := Source(tok);      // DDR CompData destined for L3_A
+
+// =====================================================================
+// Node A — Separated FIFOs (§9.1 solution)
+//
+// "A dedicated RX FIFO receives read response data exclusively.
+//  The is_sn bit in the data flit distinguishes read responses
+//  (from SN/DDR) from write requests (from RN).
+//  Even when wr_req FIFO is full, respdata FIFO can still pop."
+// =====================================================================
+
+// wr_req FIFO: independent credit pool
+chan wr_fifo_a := Queue(FIFO_DEPTH, cpu_wb_a);
+
+// respdata FIFO: independent credit pool
+chan resp_fifo_a := Queue(FIFO_DEPTH, ddr_resp_a);
+
+// =====================================================================
+// Node A — L3 internal processing
+// =====================================================================
+
+// WBQ: process WriteBack
+chan wbq_a := Queue(WBQ_DEPTH, wr_fifo_a);
+chan wb_done_a, wb_trigger_a := Fork(wbq_a);
+Sink(wb_done_a);
+
+// IRSR
+chan irsr_a := Queue(IRSR_DEPTH, wb_trigger_a);
+chan hit_a, miss_a := LoadBalancer(irsr_a);
+Sink(hit_a);
+
+// Miss → ReadNoSnp → DDR
+chan child_tok_a, wait_tok_a := Fork(miss_a);
+chan child_src_a := Source(tok);
+chan child_req_a := CtrlJoin(child_src_a, child_tok_a);
+Sink(child_req_a);
+
+// Wait for DDR CompData (from INDEPENDENT respdata FIFO!)
+chan wait_q_a := Queue(IRSR_DEPTH, wait_tok_a);
+chan done_a   := CtrlJoin(wait_q_a, resp_fifo_a);
+Sink(done_a);
+
+// =====================================================================
+// Node B — Traffic sources
+// =====================================================================
+chan cpu_wb_b   := Source(tok);      // CPU Cluster B WriteBack_Custom
+chan ddr_resp_b := Source(tok);      // DDR CompData destined for L3_B
+
+// =====================================================================
+// Node B — Separated FIFOs (§9.1 solution)
+// =====================================================================
+
+// wr_req FIFO: independent credit pool
+chan wr_fifo_b := Queue(FIFO_DEPTH, cpu_wb_b);
+
+// respdata FIFO: independent credit pool
+chan resp_fifo_b := Queue(FIFO_DEPTH, ddr_resp_b);
+
+// =====================================================================
+// Node B — L3 internal processing
+// =====================================================================
+
+// WBQ
+chan wbq_b := Queue(WBQ_DEPTH, wr_fifo_b);
+chan wb_done_b, wb_trigger_b := Fork(wbq_b);
+Sink(wb_done_b);
+
+// IRSR
+chan irsr_b := Queue(IRSR_DEPTH, wb_trigger_b);
+chan hit_b, miss_b := LoadBalancer(irsr_b);
+Sink(hit_b);
+
+// Miss → ReadNoSnp → DDR
+chan child_tok_b, wait_tok_b := Fork(miss_b);
+chan child_src_b := Source(tok);
+chan child_req_b := CtrlJoin(child_src_b, child_tok_b);
+Sink(child_req_b);
+
+// Wait for DDR CompData (from INDEPENDENT respdata FIFO!)
+chan wait_q_b := Queue(IRSR_DEPTH, wait_tok_b);
+chan done_b   := CtrlJoin(wait_q_b, resp_fifo_b);
+Sink(done_b);
